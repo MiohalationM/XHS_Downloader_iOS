@@ -1,0 +1,105 @@
+{
+  "noteData": {
+    "data": {
+      "noteData": {
+        "noteId": "6a50d3ef0000000008024e7a",
+        "title": "这张实况怎么火的",
+        "imageList": [
+          {
+            "stream": {
+              "av1": [],
+              "h264": [
+                {
+                  "defaultStream": 0,
+                  "format": "mp4",
+                  "volume": 0,
+                  "videoDuration": 2916,
+                  "audioChannels": 0,
+                  "rotate": 0,
+                  "backupUrls": [
+                    "http://sns-bak-v1.xhscdn.com/stream/1/10/19/01ea50d48b17ac8f010050039f4bbe82f6_19.mp4"
+                  ],
+                  "streamDesc": "WEB_LIVEPHOTO_19",
+                  "videoBitrate": 2159437,
+                  "audioDuration": 0,
+                  "psnr": 0,
+                  "ssim": 0,
+                  "streamType": 19,
+                  "width": 1080,
+                  "size": 790279,
+                  "videoCodec": "h264",
+                  "audioBitrate": 0,
+                  "masterUrl": "http://sns-video-v6.xhscdn.com/stream/1/10/19/01ea50d48b17ac8f010050039f4bbe82f6_19.mp4",
+                  "hdrType": 0,
+                  "qualityType": "HD",
+                  "height": 1440,
+                  "duration": 2917,
+                  "avgBitrate": 2167374,
+                  "fps": 60,
+                  "vmaf": -1,
+                  "weight": 62
+                }
+              ],
+              "h265": [],
+              "h266": []
+            },
+            "fileId": "1040g008322ek5b5j7u005otp756pidgp68d6rc8",
+            "height": 2880,
+            "width": 2160,
+            "url": "http://sns-webpic-qc.xhscdn.com/fixture/1040g008322ek5b5j7u005otp756pidgp68d6rc8!h5_1080jpg",
+            "traceId": "",
+            "infoList": [
+              {
+                "imageScene": "H5_DTL",
+                "url": "https://sns-webpic-qc.xhscdn.com/fixture/1040g008322ek5b5j7u005otp756pidgp68d6rc8!h5_1080jpg"
+              },
+              {
+                "imageScene": "H5_PRV",
+                "url": "https://sns-webpic-qc.xhscdn.com/fixture/1040g008322ek5b5j7u005otp756pidgp68d6rc8!h5_1080jpg"
+              }
+            ],
+            "livePhoto": true
+          },
+          {
+            "livePhoto": false,
+            "stream": {},
+            "fileId": "1040g008322ejuqec7o0g5otp756pidgpbd42pr8",
+            "height": 2796,
+            "width": 1290,
+            "url": "http://sns-webpic-qc.xhscdn.com/fixture/1040g008322ejuqec7o0g5otp756pidgpbd42pr8!h5_1080jpg",
+            "traceId": "",
+            "infoList": [
+              {
+                "imageScene": "H5_DTL",
+                "url": "https://sns-webpic-qc.xhscdn.com/fixture/1040g008322ejuqec7o0g5otp756pidgpbd42pr8!h5_1080jpg"
+              },
+              {
+                "imageScene": "H5_PRV",
+                "url": "https://sns-webpic-qc.xhscdn.com/fixture/1040g008322ejuqec7o0g5otp756pidgpbd42pr8!h5_1080jpg"
+              }
+            ]
+          },
+          {
+            "infoList": [
+              {
+                "imageScene": "H5_DTL",
+                "url": "https://sns-webpic-qc.xhscdn.com/fixture/1040g008322ejuqec7o105otp756pidgp740fcdg!h5_1080jpg"
+              },
+              {
+                "imageScene": "H5_PRV",
+                "url": "https://sns-webpic-qc.xhscdn.com/fixture/1040g008322ejuqec7o105otp756pidgp740fcdg!h5_1080jpg"
+              }
+            ],
+            "livePhoto": false,
+            "stream": {},
+            "fileId": "1040g008322ejuqec7o105otp756pidgp740fcdg",
+            "height": 2796,
+            "width": 1290,
+            "url": "http://sns-webpic-qc.xhscdn.com/fixture/1040g008322ejuqec7o105otp756pidgp740fcdg!h5_1080jpg",
+            "traceId": ""
+          }
+        ]
+      }
+    }
+  }
+}
