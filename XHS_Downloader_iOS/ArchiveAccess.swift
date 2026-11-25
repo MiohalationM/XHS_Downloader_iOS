@@ -11,15 +11,20 @@ struct ArchiveGrant: Codable, Hashable, Sendable {
 
     init?(bookmark: Data?) {
         guard let bookmark, let root = ArchiveDirectory.resolve(bookmark) else { return nil }
-        self.rootPath = root.standardizedFileURL.path
+        self.rootPath = Self.normalizedPath(root.path)
         self.bookmark = bookmark
     }
 
+    static func normalizedPath(_ path: String) -> String {
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        return resolved.hasSuffix("/") && resolved.count > 1 ? String(resolved.dropLast()) : resolved
+    }
+
     func relativePath(for path: String) -> String? {
-        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
-        let path = URL(fileURLWithPath: path).standardizedFileURL.path
-        guard path.hasPrefix(root + "/") else { return nil }
-        return String(path.dropFirst(root.count + 1))
+        let root = Self.normalizedPath(rootPath)
+        let candidate = Self.normalizedPath(path)
+        guard candidate.hasPrefix(root + "/") else { return nil }
+        return String(candidate.dropFirst(root.count + 1))
     }
 
     /// A renewed note grant wins over older task snapshots for the same root.
@@ -66,28 +71,32 @@ final class ArchiveAccess: @unchecked Sendable {
         var roots: [Data: URL] = [:]
         var scoped: [URL] = []
         do {
+            let homePrefix = ArchiveGrant.normalizedPath(NSHomeDirectory()) + "/"
+            let tempPrefix = ArchiveGrant.normalizedPath(FileManager.default.temporaryDirectory.path) + "/"
             let urls = try paths.map { path -> URL in
-                guard let grant = choices.first(where: { $0.relativePath(for: path) != nil }),
-                      let relative = grant.relativePath(for: path) else {
+                let matching = choices.compactMap { grant -> (ArchiveGrant, String)? in
+                    guard let relative = grant.relativePath(for: path) else { return nil }
+                    return (grant, relative)
+                }
+                for (grant, relative) in matching {
+                    if let existing = roots[grant.bookmark] {
+                        return existing.appendingPathComponent(relative)
+                    }
+                    if let resolved = ArchiveDirectory.resolve(grant.bookmark) {
+                        if resolved.startAccessingSecurityScopedResource() { scoped.append(resolved) }
+                        roots[grant.bookmark] = resolved
+                        return resolved.appendingPathComponent(relative)
+                    }
+                }
+                if matching.isEmpty {
                     // Older sandbox-local archives need no external grant.
-                    let url = URL(fileURLWithPath: path).standardizedFileURL
-                    guard url.path.hasPrefix(NSHomeDirectory() + "/") ||
-                            url.path.hasPrefix(FileManager.default.temporaryDirectory.path) else {
+                    let normalized = ArchiveGrant.normalizedPath(path)
+                    guard normalized.hasPrefix(homePrefix) || normalized.hasPrefix(tempPrefix) else {
                         throw ArchiveError.directoryUnavailable
                     }
-                    return url
+                    return URL(fileURLWithPath: normalized)
                 }
-                let root: URL
-                if let existing = roots[grant.bookmark] { root = existing }
-                else {
-                    guard let resolved = ArchiveDirectory.resolve(grant.bookmark) else {
-                        throw ArchiveError.directoryUnavailable
-                    }
-                    root = resolved
-                    if root.startAccessingSecurityScopedResource() { scoped.append(root) }
-                    roots[grant.bookmark] = root
-                }
-                return root.appendingPathComponent(relative)
+                throw ArchiveError.directoryUnavailable
             }
             return ArchiveLease(urls: urls, scopedRoots: scoped)
         } catch {
@@ -120,37 +129,39 @@ actor ArchiveMediaLoader {
     func reauthorize(grants: [ArchiveGrant], paths: [String], directory: URL) throws -> [ArchiveGrant] {
         let scoped = directory.startAccessingSecurityScopedResource()
         defer { if scoped { directory.stopAccessingSecurityScopedResource() } }
-        let bookmark = try ArchiveDirectory.makeBookmark(for: directory)
-        var candidates = grants
-        if candidates.isEmpty, let first = paths.first, var inferred = ArchiveGrant(bookmark: bookmark) {
-            var root = URL(fileURLWithPath: first).deletingLastPathComponent()
-            while !paths.allSatisfy({ URL(fileURLWithPath: $0).path.hasPrefix(root.path + "/") }), root.path != "/" {
-                root.deleteLastPathComponent()
-            }
-            // Legacy notes did not record which ancestor the user selected.
-            // Match complete relative paths, including author/note subfolders.
-            while root.path != "/" {
-                inferred.rootPath = root.path
-                let relatives = paths.compactMap { inferred.relativePath(for: $0) }
-                if relatives.count == paths.count,
-                   relatives.allSatisfy({ FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }) {
-                    candidates = [inferred]
-                    break
-                }
-                root.deleteLastPathComponent()
-            }
-        }
+        let bookmark = try ArchiveDirectory.makeBookmark(for: directory, acquireScope: false)
         var matched = false
-        let updated = candidates.map { grant -> ArchiveGrant in
+        var updated = grants.map { grant -> ArchiveGrant in
             let relative = paths.compactMap { grant.relativePath(for: $0) }
             guard !relative.isEmpty,
-                  relative.allSatisfy({ FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }) else {
+                  relative.contains(where: { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }) else {
                 return grant
             }
             matched = true
             var renewed = grant
             renewed.bookmark = bookmark
             return renewed
+        }
+        if !matched, let first = paths.first, var inferred = ArchiveGrant(bookmark: bookmark) {
+            var root = URL(fileURLWithPath: ArchiveGrant.normalizedPath(first)).deletingLastPathComponent()
+            let normalizedPaths = paths.map(ArchiveGrant.normalizedPath)
+            while !normalizedPaths.allSatisfy({ $0.hasPrefix(root.path + "/") }), root.path != "/" {
+                root.deleteLastPathComponent()
+            }
+            // Match complete relative paths from any ancestor, including when
+            // the user selected a parent directory or removed one file from a note.
+            while root.path != "/" {
+                inferred.rootPath = root.path
+                let relatives = paths.compactMap { inferred.relativePath(for: $0) }
+                if !relatives.isEmpty,
+                   relatives.contains(where: { FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path) }) {
+                    updated.removeAll { $0.rootPath == inferred.rootPath }
+                    updated.append(inferred)
+                    matched = true
+                    break
+                }
+                root.deleteLastPathComponent()
+            }
         }
         guard matched else { throw ArchiveError.directoryUnavailable }
         return updated
@@ -165,23 +176,39 @@ actor ArchiveMediaLoader {
         try Task.checkCancellation()
         var image: UIImage?
         for url in lease.urls where !MediaFileValidator.isVideoFile(url) {
-            if thumbnail {
-                if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                   let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            // Always decode into memory while the security-scoped lease is active:
+            // UIImage(contentsOfFile:) defers reads until CA render, after lease deinit.
+            if let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
+                let maxSize = thumbnail ? 600 : 4096
+                let options: [CFString: Any] = [
                     kCGImageSourceCreateThumbnailFromImageAlways: true,
                     kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: 600
-                   ] as CFDictionary) { image = UIImage(cgImage: cg) }
-            } else { image = UIImage(contentsOfFile: url.path) }
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxSize
+                ]
+                if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                    image = UIImage(cgImage: cg)
+                } else if !thumbnail, let cg = CGImageSourceCreateImageAtIndex(source, 0, [
+                    kCGImageSourceShouldCacheImmediately: true
+                ] as CFDictionary) {
+                    image = UIImage(cgImage: cg)
+                }
+            }
             if image != nil { break }
         }
         if image == nil, let video = lease.urls.first(where: { MediaFileValidator.isVideoFile($0) }) {
             let generator = AVAssetImageGenerator(asset: AVURLAsset(url: video))
             generator.appliesPreferredTrackTransform = true
             generator.maximumSize = CGSize(width: thumbnail ? 600 : 1600, height: thumbnail ? 600 : 1600)
-            if let frame = try? await generator.image(at: .zero) { image = UIImage(cgImage: frame.image) }
-            // A valid movie can play even if its first frame cannot be decoded.
-            if image == nil { image = UIImage() }
+            let frame = try? await withTaskCancellationHandler {
+                try await generator.image(at: .zero)
+            } onCancel: {
+                generator.cancelAllCGImageGeneration()
+            }
+            if let frame { image = UIImage(cgImage: frame.image) }
+            // In thumbnail grids, throw so the UI renders its video placeholder
+            // instead of a blank 0x0 image that never caches.
+            if image == nil && !thumbnail { image = UIImage() }
         }
         try Task.checkCancellation()
         guard let image else { throw CocoaError(.fileReadCorruptFile) }
@@ -189,6 +216,10 @@ actor ArchiveMediaLoader {
             thumbnails.setObject(image, forKey: identifier as NSString, cost: cg.bytesPerRow * cg.height)
         }
         return image
+    }
+
+    func invalidate(identifiers: Set<String>) {
+        for id in identifiers { thumbnails.removeObject(forKey: id as NSString) }
     }
 
     func clearThumbnails() { thumbnails.removeAllObjects() }
@@ -223,6 +254,12 @@ actor MediaDeletionService {
                 }
                 deleted.insert(id)
             } catch { failures.append(id) }
+        }
+        if !deleted.isEmpty {
+            let deletedIDs = deleted
+            let deletedList = Array(deleted)
+            await ArchiveMediaLoader.shared.invalidate(identifiers: deletedIDs)
+            await MainActor.run { MediaPreviewImages.shared.remove(identifiers: deletedList) }
         }
         if !failures.isEmpty { throw MediaDeletionFailure(deleted: deleted, failures: failures) }
     }

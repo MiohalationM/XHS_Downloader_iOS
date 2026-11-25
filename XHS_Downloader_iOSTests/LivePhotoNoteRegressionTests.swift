@@ -16,8 +16,8 @@ struct LivePhotoNoteRegressionTests {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MobileShareFixtureProtocol.self]
         let downloader = XHSDownloader(session: URLSession(configuration: configuration))
-        let resolved = try await downloader.resolveNote(from: "这张实况怎么火的 https://xhslink.cn/o/6p0ElytBIWP")
-        #expect(resolved.noteID == "6a50d3ef0000000008024e7a")
+        let resolved = try await downloader.resolveNote(from: "DeepSeek V4.1 Flash：更强、更快、更普惠 https://xhslink.cn/o/8aTjW8TdKAF")
+        #expect(resolved.noteID == "6aa2443700000000260303c2")
         #expect(URLComponents(url: resolved.canonicalURL, resolvingAgainstBaseURL: false)?
             .queryItems?.contains(URLQueryItem(name: "xsec_token", value: "fixture-token")) == true)
         #expect(resolved.media.map(\.type) == [.livePhoto, .image, .image])
@@ -129,7 +129,7 @@ struct LivePhotoNoteRegressionTests {
         #expect(PhotoImportMetadata.isProcessingTelemetry(#"{\"capa_image_quality_process_sink_v2\":\"1\",\"DeviceModel\":\"iPhone15,5\"}"#))
         #expect(PhotoImportMetadata.isProcessingTelemetry(#"{"capa_image_quality_process_sink":"1"}"#))
         for caption in [
-            "这张实况怎么火的", "capa_image_quality_process_sink_v2",
+            "DeepSeek V4.1 Flash：更强、更快、更普惠", "capa_image_quality_process_sink_v2",
             #"{"caption":"旅行随拍","DeviceModel":"iPhone15,5"}"#,
             #"{"caption":"作者自己的说明","capa_image_quality_process_sink":"1"}"#
         ] {
@@ -168,7 +168,7 @@ private final class MobileShareFixtureProtocol: URLProtocol, @unchecked Sendable
         // Reproduce the observed server behavior: desktop requests get the home
         // page, so they cannot resolve this particular app-share link.
         let mobile = request.value(forHTTPHeaderField: "User-Agent")?.contains("iPhone") == true
-        let canonical = URL(string: "https://www.xiaohongshu.com/discovery/item/6a50d3ef0000000008024e7a?xsec_token=fixture-token")!
+        let canonical = URL(string: "https://www.xiaohongshu.com/discovery/item/6aa2443700000000260303c2?xsec_token=fixture-token")!
         let home = URL(string: "https://www.xiaohongshu.com/")!
         do {
             let file = try #require(Bundle(for: LivePhotoFixtureBundle.self)

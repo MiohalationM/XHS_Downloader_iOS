@@ -5,7 +5,22 @@ struct NoteAuthorAvatar: View {
     let name: String
     let url: URL?
     let size: CGFloat
+    var isActive: Bool = true
     @State private var savedImage: UIImage?
+
+    private struct AvatarLoadKey: Equatable {
+        let url: URL?
+        let active: Bool
+    }
+
+    init(name: String, url: URL?, size: CGFloat, isActive: Bool = true) {
+        self.name = name
+        self.url = url
+        self.size = size
+        self.isActive = isActive
+        let initial = isActive ? url.flatMap { AuthorAvatarStore.shared.cachedImage(for: $0) } : nil
+        _savedImage = State(initialValue: initial)
+    }
 
     var body: some View {
         ZStack {
@@ -17,12 +32,84 @@ struct NoteAuthorAvatar: View {
             }
         }
         .frame(width: size, height: size).clipShape(Circle()).accessibilityHidden(true)
-        .task(id: url) {
+        .task(id: AvatarLoadKey(url: url, active: isActive)) {
+            guard isActive, let url else {
+                savedImage = nil
+                return
+            }
+            if let cached = AuthorAvatarStore.shared.cachedImage(for: url) {
+                savedImage = cached
+                return
+            }
             savedImage = nil
-            if let url, let data = await AuthorAvatarStore.shared.imageData(for: url), !Task.isCancelled {
+            if let data = await AuthorAvatarStore.shared.imageData(for: url), !Task.isCancelled {
                 savedImage = UIImage(data: data)
             }
         }
+    }
+}
+
+struct NoteFeedCardFooter: View {
+    let author: String
+    let avatarURL: URL?
+    let liked: Bool
+    let isSelecting: Bool
+    var isNearViewport: Bool = true
+    var authorProfileURL: URL? = nil
+    var noteID: String = ""
+    var onOpen: (() -> Void)? = nil
+    var onLike: (() -> Void)? = nil
+
+    @ScaledMetric(relativeTo: .caption2) private var authorSize: CGFloat = 11
+    @Environment(\.openURL) private var openURL
+
+    private var isInteractive: Bool { onOpen != nil || onLike != nil }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if isInteractive {
+                Button {
+                    if isSelecting { onOpen?() }
+                    else if let profileURL = authorProfileURL { AppFeedback.play(.navigation); openURL(profileURL) }
+                } label: {
+                    authorLabel
+                }
+                .buttonStyle(.plain)
+                .disabled(!isSelecting && authorProfileURL == nil)
+                .accessibilityIdentifier("feed-author-\(noteID)")
+                .accessibilityValue(authorProfileURL?.absoluteString ?? "")
+                if !isSelecting {
+                    Button { onLike?() } label: {
+                        Image(systemName: liked ? "heart.fill" : "heart")
+                            .font(.system(size: 18)).foregroundStyle(liked ? Color.coral : Color.secondary)
+                            .contentTransition(.symbolEffect(.replace))
+                            .symbolEffect(.bounce, value: liked)
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(L10n.text(liked ? "feed.bookmark.remove" : "feed.bookmark"))
+                    .accessibilityIdentifier("feed-like-\(noteID)")
+                }
+            } else {
+                authorLabel
+                if !isSelecting {
+                    Image(systemName: liked ? "heart.fill" : "heart")
+                        .font(.system(size: 18)).foregroundStyle(liked ? Color.coral : Color.secondary)
+                        .frame(width: 44, height: 44)
+                }
+            }
+        }
+        .padding(.leading, 10).padding(.trailing, 5)
+        .allowsHitTesting(isInteractive)
+    }
+
+    private var authorLabel: some View {
+        HStack(spacing: 6) {
+            NoteAuthorAvatar(name: author, url: avatarURL, size: 20, isActive: isNearViewport)
+            Text(author).font(.system(size: authorSize)).foregroundStyle(.secondary).lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 44)
+        .contentShape(Rectangle())
     }
 }
 
@@ -34,13 +121,12 @@ struct NoteFeedCard: View {
     let liked: Bool
     let loading: Bool
     let previewRevision: Int
+    var isNearViewport: Bool = true
     let namespace: Namespace.ID
     @ObservedObject var heroGeometry: NoteHeroGeometry
     let onOpen: () -> Void
     let onLike: () -> Void
     @ScaledMetric(relativeTo: .subheadline) private var titleSize: CGFloat = 15
-    @ScaledMetric(relativeTo: .caption2) private var authorSize: CGFloat = 11
-    @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var cardIdentifier: String { note.cover?.id ?? note.id }
@@ -49,56 +135,59 @@ struct NoteFeedCard: View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: onOpen) {
                 VStack(alignment: .leading, spacing: 0) {
-                    if let cover = note.cover {
-                        PhotoAssetThumbnail(localIdentifier: cover.id)
-                            .id(previewRevision)
-                            .allowsHitTesting(false)
-                            .frame(width: width, height: width / note.coverRatio)
-                            .clipped()
-                            .modifier(NoteHeroFrame(geometry: heroGeometry, role: "image", id: note.id))
-                            .overlay(alignment: .topTrailing) {
-                                if isSelecting {
-                                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                                        .font(.system(size: 24)).symbolRenderingMode(.palette)
-                                        .foregroundStyle(selected ? Color.coral : .white, .white)
-                                        .shadow(radius: 2).padding(8)
-                                } else if cover.isVideo {
-                                    Image(systemName: "play.fill")
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundStyle(.white)
-                                        .frame(width: 26, height: 26)
-                                        .background(.black.opacity(0.45), in: Circle())
-                                        .overlay(Circle().strokeBorder(.white.opacity(0.28), lineWidth: 0.5))
-                                        .padding(8)
+                    ZStack {
+                        if let cover = note.cover {
+                            PhotoAssetThumbnail(localIdentifier: cover.id, isActive: isNearViewport, targetPixelSize: 720)
+                                .id(previewRevision)
+                                .allowsHitTesting(false)
+                                .frame(width: width, height: width / note.coverRatio)
+                                .clipped()
+                                .overlay(alignment: .topTrailing) {
+                                    if isSelecting {
+                                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                                            .font(.system(size: 24)).symbolRenderingMode(.palette)
+                                            .foregroundStyle(selected ? Color.coral : .white, .white)
+                                            .shadow(radius: 2).padding(8)
+                                    } else if cover.isVideo {
+                                        Image(systemName: "play.fill")
+                                            .font(.system(size: 11, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .frame(width: 26, height: 26)
+                                            .background(.black.opacity(0.45), in: Circle())
+                                            .overlay(Circle().strokeBorder(.white.opacity(0.28), lineWidth: 0.5))
+                                            .padding(8)
+                                    }
                                 }
-                            }
-                            .overlay(alignment: .bottomLeading) {
-                                if cover.isLive {
-                                    Label("LIVE", systemImage: "livephoto")
-                                        .font(.system(size: 10, weight: .semibold)).padding(.horizontal, 7).padding(.vertical, 4)
-                                        .foregroundStyle(.white)
-                                        .background(.black.opacity(0.45), in: Capsule())
-                                        .overlay(Capsule().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
-                                        .padding(8)
+                                .overlay(alignment: .bottomLeading) {
+                                    if cover.isLive {
+                                        Label("LIVE", systemImage: "livephoto")
+                                            .font(.system(size: 10, weight: .semibold)).padding(.horizontal, 7).padding(.vertical, 4)
+                                            .foregroundStyle(.white)
+                                            .background(.black.opacity(0.45), in: Capsule())
+                                            .overlay(Capsule().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                                            .padding(8)
+                                    }
                                 }
-                            }
-                            .overlay {
-                                if loading { ProgressView().tint(.white).padding(12).background(.black.opacity(0.45), in: Circle()) }
-                            }
-                    } else {
-                        // A note saved without media still needs a card: the body
-                        // summary replaces the cover instead of leaving a hole.
-                        TextSummaryCover(note: note, width: width, height: width / note.coverRatio)
-                            .modifier(NoteHeroFrame(geometry: heroGeometry, role: "image", id: note.id))
-                            .overlay(alignment: .topTrailing) {
-                                if isSelecting {
-                                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                                        .font(.system(size: 24)).symbolRenderingMode(.palette)
-                                        .foregroundStyle(selected ? Color.coral : .white, .white)
-                                        .shadow(radius: 2).padding(8)
+                                .overlay {
+                                    if loading { ProgressView().tint(.white).padding(12).background(.black.opacity(0.45), in: Circle()) }
                                 }
-                            }
+                        } else {
+                            // A note saved without media still needs a card: the body
+                            // summary replaces the cover instead of leaving a hole.
+                            TextSummaryCover(note: note, width: width, height: width / note.coverRatio)
+                                .overlay(alignment: .topTrailing) {
+                                    if isSelecting {
+                                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                                            .font(.system(size: 24)).symbolRenderingMode(.palette)
+                                            .foregroundStyle(selected ? Color.coral : .white, .white)
+                                            .shadow(radius: 2).padding(8)
+                                    }
+                                }
+                        }
                     }
+                    .frame(width: width, height: width / note.coverRatio)
+                    .clipped()
+                    .modifier(NoteHeroFrame(geometry: heroGeometry, role: "image", id: note.id))
                     if !note.title.isEmpty {
                         NoteHeroTitle(text: note.title, size: titleSize, lines: 2, geometry: heroGeometry, id: note.id)
                             .modifier(NoteHeroFrame(geometry: heroGeometry, role: "title", id: note.id))
@@ -108,43 +197,25 @@ struct NoteFeedCard: View {
                 }
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PressableButtonStyle(scale: 0.975))
+            .buttonStyle(PressableButtonStyle(scale: 1))
             .opacity(heroGeometry.concealedContentID == note.id ? 0 : 1)
             .animation(nil, value: heroGeometry.concealedContentID)
             .accessibilityIdentifier("library-item-\(cardIdentifier)")
             .accessibilityLabel(note.title.isEmpty ? note.author : note.title)
             .accessibilityValue(isSelecting && selected ? L10n.text("library.selected") : "")
             .accessibilityAddTraits(isSelecting && selected ? .isSelected : [])
-            HStack(spacing: 0) {
-                Button {
-                    if isSelecting { onOpen() }
-                    else if let profileURL = note.authorProfileURL { AppFeedback.play(.navigation); openURL(profileURL) }
-                } label: {
-                    HStack(spacing: 6) {
-                        NoteAuthorAvatar(name: note.author, url: note.avatarURL, size: 20)
-                        Text(note.author).font(.system(size: authorSize)).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 44)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(!isSelecting && note.authorProfileURL == nil)
-                .accessibilityIdentifier("feed-author-\(note.id)")
-                .accessibilityValue(note.authorProfileURL?.absoluteString ?? "")
-                if !isSelecting {
-                    Button(action: onLike) {
-                        Image(systemName: liked ? "heart.fill" : "heart")
-                            .font(.system(size: 18)).foregroundStyle(liked ? Color.coral : Color.secondary)
-                            .contentTransition(.symbolEffect(.replace))
-                            .symbolEffect(.bounce, value: liked)
-                            .frame(width: 44, height: 44)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(L10n.text(liked ? "feed.bookmark.remove" : "feed.bookmark"))
-                    .accessibilityIdentifier("feed-like-\(note.id)")
-                }
-            }
-            .padding(.leading, 10).padding(.trailing, 5)
+            NoteFeedCardFooter(
+                author: note.author,
+                avatarURL: note.avatarURL,
+                liked: liked,
+                isSelecting: isSelecting,
+                isNearViewport: isNearViewport,
+                authorProfileURL: note.authorProfileURL,
+                noteID: note.id,
+                onOpen: onOpen,
+                onLike: onLike
+            )
+            .modifier(NoteHeroFrame(geometry: heroGeometry, role: "footer", id: note.id))
         }
         .background(Color.cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -212,7 +283,11 @@ enum NoteCaption {
             url.scheme = "xhsdn"; url.host = "topic"
             url.queryItems = [URLQueryItem(name: "name", value: topic)]
             result[attributedRange].link = url.url
-            result[attributedRange].foregroundColor = Color(red: 0.12, green: 0.31, blue: 0.46)
+            result[attributedRange].foregroundColor = Color(uiColor: UIColor { traits in
+                traits.userInterfaceStyle == .dark
+                    ? UIColor(red: 0.44, green: 0.72, blue: 0.96, alpha: 1)
+                    : UIColor(red: 0.12, green: 0.31, blue: 0.46, alpha: 1)
+            })
         }
         return result
     }
@@ -243,10 +318,13 @@ struct NoteReaderView: View {
     @State private var share: MediaShareFiles?
     @State private var shareDirectory: URL?
     @State private var copied = false
+    @State private var copyResetTask: Task<Void, Never>?
     @ScaledMetric(relativeTo: .title3) private var titleSize: CGFloat = 20
     @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = 16
     @Environment(\.openURL) private var openURL
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    @MainActor
     init(note: LibraryNote, initialImage: UIImage, coordinator: DownloadCoordinator,
          namespace: Namespace.ID, heroGeometry: NoteHeroGeometry, onClose: @escaping () -> Void,
          onDelete: @escaping (Set<String>) async throws -> Void, onCopy: @escaping (String) -> Void,
@@ -254,8 +332,10 @@ struct NoteReaderView: View {
         self.note = note; self.initialImage = initialImage; self.coordinator = coordinator
         self.namespace = namespace; self.onDelete = onDelete; self.onCopy = onCopy; self.onTopic = onTopic
         self.heroGeometry = heroGeometry; self.onClose = onClose
+        let initialSelected = note.cover?.id ?? ""
         _media = State(initialValue: note.media)
-        _selected = State(initialValue: note.cover?.id ?? "")
+        _selected = State(initialValue: initialSelected)
+        heroGeometry.canPageBackward = (note.media.firstIndex { $0.id == initialSelected } ?? 0) > 0
     }
 
     var body: some View {
@@ -264,6 +344,7 @@ struct NoteReaderView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     if media.isEmpty {
                         TextOnlyHero(note: note, width: geometry.size.width)
+                            .modifier(NoteHeroFrame(geometry: heroGeometry, role: "image", id: note.id))
                             .modifier(NoteHeroFrame(geometry: heroGeometry, role: "viewport", id: note.id))
                     } else {
                         let height = min(geometry.size.width / note.coverRatio, geometry.size.height * 0.78)
@@ -288,9 +369,9 @@ struct NoteReaderView: View {
                                     .contentTransition(.numericText())
                                     .padding(.horizontal, 10).padding(.vertical, 6)
                                     .foregroundStyle(.white)
-                                    .glassEffect(.regular.tint(.black.opacity(0.28)), in: Capsule())
+                                    .xhsGlass(tint: .black.opacity(0.28), darkOverlay: true, in: Capsule())
                                     .padding(12)
-                                    .animation(.snappy, value: selected)
+                                    .animation(XHSDesign.animation(reduceMotion, XHSDesign.snappy), value: selected)
                             }
                         }
                         .overlay(alignment: .bottomTrailing) {
@@ -298,9 +379,9 @@ struct NoteReaderView: View {
                                 Image(systemName: "arrow.up.left.and.arrow.down.right")
                                     .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
                                     .frame(width: 44, height: 44).contentShape(Circle())
+                                    .xhsGlass(tint: .black.opacity(0.22), interactive: true, darkOverlay: true, in: Circle())
                             }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.tint(.black.opacity(0.22)).interactive(), in: Circle())
+                            .buttonStyle(.xhsGlass)
                             .accessibilityLabel(L10n.text("library.open"))
                             .accessibilityIdentifier("note-expand-media").padding(12)
                         }
@@ -312,7 +393,7 @@ struct NoteReaderView: View {
                                         .frame(width: selected == item.id ? 14 : 5, height: 5)
                                 }
                             }
-                            .animation(.spring(response: 0.32, dampingFraction: 0.8), value: selected)
+                            .animation(XHSDesign.animation(reduceMotion, .spring(response: 0.32, dampingFraction: 0.8)), value: selected)
                             .frame(maxWidth: .infinity).padding(.top, 12).padding(.bottom, 2).accessibilityHidden(true)
                         }
                     }
@@ -358,10 +439,25 @@ struct NoteReaderView: View {
             .modifier(NoteHeroFrame(geometry: imageGeometry, role: "scroll", id: selected))
             .background(Color(uiColor: .systemBackground))
         }
-        .safeAreaBar(edge: .top, spacing: 0) { authorBar }
-        .safeAreaBar(edge: .bottom, spacing: 0) { actionBar }
+        .xhsSafeAreaBar(edge: .top, spacing: 0) {
+            authorBar
+                .modifier(NoteHeroFrame(geometry: heroGeometry, role: "topBar", id: note.id))
+                .modifier(NoteHeroFrame(geometry: imageGeometry, role: "topBar", id: selected))
+                .background { readerBarScrim(edge: .top) }
+        }
+        .xhsSafeAreaBar(edge: .bottom, spacing: 0) {
+            actionBar
+                .modifier(NoteHeroFrame(geometry: heroGeometry, role: "bottomBar", id: note.id))
+                .modifier(NoteHeroFrame(geometry: imageGeometry, role: "bottomBar", id: selected))
+                .background { readerBarScrim(edge: .bottom) }
+        }
         .background(Color(uiColor: .systemBackground))
-        .onChange(of: selected) { _, _ in if presentation.selection == nil { AppFeedback.play(.selection) } }
+        .onAppear { syncPagerState() }
+        .onChange(of: selected) { _, _ in
+            syncPagerState()
+            if presentation.selection == nil { AppFeedback.play(.selection) }
+        }
+        .onChange(of: media.count) { _, _ in syncPagerState() }
         .background {
             NoteHeroPresentation(item: $presentation.selection, card: false, source: imageGeometry, destination: viewerGeometry,
                                  preview: { $0.image }, onDismiss: { if media.isEmpty { onClose() } }) { selection, close in
@@ -376,7 +472,11 @@ struct NoteReaderView: View {
         .onChange(of: presentation.errorMessage) { _, message in
             if let message { errorMessage = message; presentation.errorMessage = nil }
         }
-        .onDisappear { presentation.cancel() }
+        .onDisappear {
+            copyResetTask?.cancel()
+            copyResetTask = nil
+            presentation.cancel()
+        }
         .alert(showsDeletion ? L10n.format("library.delete.title", deletion.count) : L10n.text("common.notice"),
                isPresented: Binding(get: { showsDeletion || errorMessage != nil }, set: {
                    if !$0 { showsDeletion = false; errorMessage = nil }
@@ -401,15 +501,37 @@ struct NoteReaderView: View {
         .tint(.coral)
     }
 
+    @ViewBuilder
+    private func readerBarScrim(edge: VerticalEdge) -> some View {
+        if #available(iOS 26.0, *) {
+            EmptyView()
+        } else {
+            let base = Color(uiColor: .systemBackground)
+            LinearGradient(
+                stops: edge == .top
+                    ? [.init(color: base.opacity(0.95), location: 0),
+                       .init(color: base.opacity(0.78), location: 0.72),
+                       .init(color: base.opacity(0), location: 1)]
+                    : [.init(color: base.opacity(0), location: 0),
+                       .init(color: base.opacity(0.78), location: 0.28),
+                       .init(color: base.opacity(0.95), location: 1)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea(edges: edge == .top ? .top : .bottom)
+            .allowsHitTesting(false)
+        }
+    }
+
     private var authorBar: some View {
-        GlassEffectContainer(spacing: 8) {
+        XHSGlassContainer(spacing: 8) {
             HStack(spacing: 8) {
                 Button { AppFeedback.play(.navigation); onClose() } label: {
                     Image(systemName: "chevron.left").font(.system(size: 18, weight: .semibold))
                         .frame(width: 44, height: 44).contentShape(Circle())
+                        .xhsGlass(interactive: true, in: Circle())
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Circle())
+                .buttonStyle(.xhsGlass)
                 .accessibilityLabel(L10n.text("common.done")).accessibilityIdentifier("note-close")
                 Button {
                     if let profileURL = note.authorProfileURL { AppFeedback.play(.navigation); openURL(profileURL) }
@@ -425,20 +547,22 @@ struct NoteReaderView: View {
                     }
                     .padding(.leading, 6).padding(.trailing, 14)
                     .frame(minHeight: 44).contentShape(Capsule())
+                    .xhsGlass(interactive: true, in: Capsule())
                 }
-                .buttonStyle(.plain).disabled(note.authorProfileURL == nil)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .buttonStyle(.xhsGlass).disabled(note.authorProfileURL == nil)
                 .accessibilityIdentifier("note-author-profile")
                 .accessibilityValue(note.authorProfileURL?.absoluteString ?? "")
                 Spacer(minLength: 4)
                 if let sourceURL = note.sourceURL {
                     Button { AppFeedback.play(.navigation); openURL(sourceURL) } label: {
                         Text(L10n.text("feed.source")).font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                             .foregroundStyle(.white).padding(.horizontal, 14)
                             .frame(minHeight: 44).contentShape(Capsule())
+                            .xhsGlass(tint: .coral, prominent: true, interactive: true, in: Capsule())
                     }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.tint(.coral).interactive(), in: Capsule())
+                    .buttonStyle(.xhsGlass)
                     .accessibilityIdentifier("note-source")
                 }
                 Menu {
@@ -458,7 +582,7 @@ struct NoteReaderView: View {
                         .frame(width: 44, height: 44).contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Circle())
+                .xhsGlass(interactive: true, in: Circle())
                 .accessibilityLabel(L10n.text("common.more")).accessibilityIdentifier("note-more")
             }
             .foregroundStyle(.primary)
@@ -468,7 +592,7 @@ struct NoteReaderView: View {
 
     private var actionBar: some View {
         let favorited = coordinator.likedNotes.contains(note.id)
-        return GlassEffectContainer(spacing: 10) {
+        return XHSGlassContainer(spacing: 10) {
             HStack(spacing: 10) {
                 Button { copyCaption() } label: {
                     HStack(spacing: 8) {
@@ -482,9 +606,9 @@ struct NoteReaderView: View {
                     .padding(.horizontal, 16)
                     .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
                     .contentShape(Capsule())
+                    .xhsGlass(interactive: true, in: Capsule())
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .buttonStyle(.xhsGlass)
                 .disabled(note.body.isEmpty).accessibilityIdentifier("note-copy-caption")
                 HStack(spacing: 0) {
                     Button { coordinator.toggleLike(noteID: note.id) } label: {
@@ -505,11 +629,11 @@ struct NoteReaderView: View {
                     .accessibilityLabel(L10n.text("library.notes.share")).accessibilityIdentifier("note-share")
                 }
                 .padding(.horizontal, 4)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .xhsGlass(interactive: true, in: Capsule())
             }
         }
         .padding(.horizontal, 14).padding(.top, 6).padding(.bottom, 4)
-        .animation(.snappy, value: copied)
+        .animation(XHSDesign.animation(reduceMotion, XHSDesign.snappy), value: copied)
     }
 
     private struct TextOnlyHero: View {
@@ -539,11 +663,17 @@ struct NoteReaderView: View {
         }
     }
 
+    private func syncPagerState() {
+        heroGeometry.canPageBackward = (media.firstIndex { $0.id == selected } ?? 0) > 0
+    }
+
     private func copyCaption() {
         onCopy(note.body)
         copied = true
-        Task {
+        copyResetTask?.cancel()
+        copyResetTask = Task {
             try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
             copied = false
         }
     }

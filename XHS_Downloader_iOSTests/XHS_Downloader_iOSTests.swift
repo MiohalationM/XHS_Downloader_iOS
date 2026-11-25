@@ -16,9 +16,21 @@ struct XHS_Downloader_iOSTests {
     }
 
     @Test func extractsExactXHSShareTextFromClipboard() async {
-        let input = "🐰夏天跟兔兔一起度过！ 萤火虫d3阿米娅@uuohz 📷富士... http://xhslink.cn/o/6k5VEtmd2WX \n复制这段，去【小红书】发现更多好内容~"
-        #expect(XHSURLDetector.extract(from: input) == [
-            "http://xhslink.cn/o/6k5VEtmd2WX"
+        let first = "DeepSeek V4.1 Flash：更强、更快、更普惠 今天，我们... https://xhslink.cn/o/8aTjW8TdKAF 先复制一下，然后去【小红书】搜索查看笔记。"
+        let second = "DeepSeek 寻找闪亮发光的你 DeepSeek 的用人原则是，... https://xhslink.cn/o/6gWL8xC4pDm 复制这段文字，打开【小红书】一键直达笔记。"
+        #expect(XHSURLDetector.extract(from: first) == [
+            "https://xhslink.cn/o/8aTjW8TdKAF"
+        ])
+        #expect(XHSURLDetector.extract(from: second) == [
+            "https://xhslink.cn/o/6gWL8xC4pDm"
+        ])
+        #expect(XHSURLDetector.extract(from: first + "\n" + second) == [
+            "https://xhslink.cn/o/8aTjW8TdKAF",
+            "https://xhslink.cn/o/6gWL8xC4pDm"
+        ])
+        #expect(ImportText.extractLinks(from: first + "\n" + second) == [
+            "https://xhslink.cn/o/8aTjW8TdKAF",
+            "https://xhslink.cn/o/6gWL8xC4pDm"
         ])
     }
 

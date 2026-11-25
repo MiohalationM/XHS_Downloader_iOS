@@ -57,6 +57,9 @@ struct MediaAssetRecord: Identifiable, Codable, Hashable {
     var byteCount: Int64?
     var createdAt: Date
     var filesPaths: [String]?
+    /// Archive paths that already existed on disk and were reused via
+    /// `skipExisting`. Deletion must never unlink files this note did not create.
+    var reusedFilesPaths: [String]?
     var contentType: String?
     var isLive: Bool?
 
@@ -123,6 +126,9 @@ struct DownloadTaskRecord: Identifiable, Codable, Hashable {
     var selectedVariants: [String: String]?
     var downloadInstant: Date?
     var archiveTextPaths: [String]?
+    /// Caption paths that already existed on disk and were reused via
+    /// `skipExisting`. Deletion must never unlink files this task did not create.
+    var reusedArchiveTextPaths: [String]? = nil
     /// Media slots that were submitted, captured before parsing. This is what a
     /// resumed task re-renders against, so an expired URL cannot change the
     /// expected resource set.
@@ -279,26 +285,8 @@ struct SelectiveDownloadState: Identifiable {
 }
 
 enum XHSURLDetector {
-    private static let expression = try! NSRegularExpression(
-        pattern: ImportText.linkPattern,
-        options: [.caseInsensitive]
-    )
-
     static func extract(from input: String) -> [String] {
-        let range = NSRange(input.startIndex..<input.endIndex, in: input)
-        var seen = Set<String>()
-        return expression.matches(in: input, range: range).compactMap { match in
-            guard let swiftRange = Range(match.range, in: input) else { return nil }
-            var value = String(input[swiftRange])
-            while let last = value.last, ".,;:!?)]}".contains(last) { value.removeLast() }
-            if !value.lowercased().hasPrefix("http") { value = "https://" + value }
-            guard let url = URL(string: value), let host = url.host?.lowercased() else { return nil }
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            components?.host = host
-            value = components?.url?.absoluteString ?? value
-            guard seen.insert(value).inserted else { return nil }
-            return value
-        }
+        ImportText.extractLinks(from: input)
     }
 
     static func first(from input: String) -> String? {
@@ -315,7 +303,8 @@ enum XHSURLDetector {
                 .contains(url.host?.lowercased() ?? "") else { return nil }
         let path = url.pathComponents.filter { $0 != "/" }
         let isNote = (path.count == 2 && path.first == "explore") ||
-            (path.count == 3 && path[0] == "discovery" && path[1] == "item")
+            (path.count == 3 && path[0] == "discovery" && path[1] == "item") ||
+            (path.count == 4 && path[0] == "user" && path[1] == "profile")
         guard isNote, let id = path.last, id.utf8.count == 24,
               id.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) }) else { return nil }
         return id
@@ -408,7 +397,7 @@ final class AppSettings: ObservableObject {
         selectiveDownload = defaults.object(forKey: Key.selectiveDownload) as? Bool ?? false
         debugNotifications = defaults.object(forKey: Key.debugNotifications) as? Bool ?? false
         keepScreenAwake = defaults.object(forKey: Key.keepScreenAwake) as? Bool ?? false
-        clipboardSuggestions = defaults.object(forKey: Key.clipboardSuggestions) as? Bool ?? true
+        clipboardSuggestions = defaults.object(forKey: Key.clipboardSuggestions) as? Bool ?? false
         if defaults === UserDefaults.standard { FeedbackPreference.synchronizeExtension(haptics) }
         UIApplication.shared.isIdleTimerDisabled = false
     }
@@ -454,13 +443,14 @@ actor DownloadTaskStore: DownloadTaskStoring {
 
     private func openRepository() throws {
         guard !didOpen else { return }
-        didOpen = true
-        guard let databaseURL else { return }
+        guard let databaseURL else { didOpen = true; return }
         do {
             try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let configuration = ModelConfiguration(url: databaseURL)
             let container = try ModelContainer(for: StoredDownloadTask.self, RepositoryMarker.self, configurations: configuration)
             repository = TaskRepository(modelContainer: container)
+            repositoryError = nil
+            didOpen = true
         } catch {
             repositoryError = error
             throw error

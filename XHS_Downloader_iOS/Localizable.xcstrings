@@ -1434,6 +1434,28 @@
         }
       }
     },
+    "detail.blocked.selection": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for media selection"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待选择媒体"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待選擇媒體"
+          }
+        }
+      }
+    },
     "detail.caption": {
       "extractionState": "stale",
       "localizations": {
@@ -2408,6 +2430,28 @@
         }
       }
     },
+    "error.no_media_filtered": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No media saved: all items were skipped by your current filter settings."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未保存媒体：当前内容筛选设置已跳过全部媒体。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未儲存媒體：目前的內容篩選設定已略過全部媒體。"
+          }
+        }
+      }
+    },
     "error.no_media_selected": {
       "localizations": {
         "en": {
@@ -2472,6 +2516,50 @@
           "stringUnit": {
             "state": "translated",
             "value": "成功儲存 %d / %d 項，任務已標記為失敗。"
+          }
+        }
+      }
+    },
+    "error.partial_files_saved_photos_failed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Saved to Files; Photos pending retry."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已保存 Files，相册待重试。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已儲存至 Files，相簿待重試。"
+          }
+        }
+      }
+    },
+    "error.partial_photos_saved_files_failed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Saved to Photos; Files pending retry."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已保存相册，Files 待重试。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已儲存至相簿，Files 待重試。"
           }
         }
       }
@@ -5373,6 +5461,72 @@
         }
       }
     },
+    "settings.about.license": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open-Source License"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开源协议"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開源協議"
+          }
+        }
+      }
+    },
+    "settings.about.license_notice": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Licensed under GNU AGPL-3.0, derived from and inspired by the upstream projects above. Provided \"as is\" without warranty of any kind."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "本项目基于 GNU AGPL-3.0 协议开源，衍生并参考自上述上游项目。本软件按“原样”提供，不附带任何明示或暗示担保。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "本專案基於 GNU AGPL-3.0 協議開源，衍生並參考自上述上游專案。本軟體按「原樣」提供，不附帶任何明示或暗示擔保。"
+          }
+        }
+      }
+    },
+    "settings.about.open_source": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Source & Credits"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开源与致谢"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開源與致謝"
+          }
+        }
+      }
+    },
     "settings.about.release_notes": {
       "localizations": {
         "en": {
@@ -6336,19 +6490,19 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "%.0f s"
+            "value": "%.1f s"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "%.0f 秒"
+            "value": "%.1f 秒"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "%.0f 秒"
+            "value": "%.1f 秒"
           }
         }
       }

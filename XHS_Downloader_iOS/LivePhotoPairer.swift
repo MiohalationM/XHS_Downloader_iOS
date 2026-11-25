@@ -11,7 +11,7 @@ enum LivePhotoPairer {
     struct Pair: Sendable { let photo: URL; let video: URL }
 
     static func pair(photo: URL, video: URL) async throws -> Pair {
-        let directory = photo.deletingLastPathComponent()
+        let directory = FileManager.default.temporaryDirectory
         let source = CGImageSourceCreateWithURL(photo as CFURL, nil)
         let properties = source.flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }
         let maker = properties?[kCGImagePropertyMakerAppleDictionary] as? [String: Any]
@@ -58,7 +58,11 @@ enum LivePhotoPairer {
             if let value = originalProperties[property] as? NSObject,
                !value.isEqual(properties[property]) { throw LivePhotoPairingError.unsupported }
         }
-        for type in [kCGImageAuxiliaryDataTypeHDRGainMap, kCGImageAuxiliaryDataTypeISOGainMap] {
+        var auxiliaryTypes: [CFString] = [kCGImageAuxiliaryDataTypeHDRGainMap]
+        if #available(iOS 18.0, *) {
+            auxiliaryTypes.append(kCGImageAuxiliaryDataTypeISOGainMap)
+        }
+        for type in auxiliaryTypes {
             if let originalMap = CGImageSourceCopyAuxiliaryDataInfoAtIndex(original, 0, type) as NSDictionary? {
                 guard let copiedMap = CGImageSourceCopyAuxiliaryDataInfoAtIndex(output, 0, type) as NSDictionary?,
                       let data = originalMap[kCGImageAuxiliaryDataInfoData] as? Data,
@@ -81,22 +85,26 @@ enum LivePhotoPairer {
         contentID.dataType = kCMMetadataBaseDataType_UTF8 as String
         writer.metadata = try await asset.load(.metadata).filter { $0.identifier != .quickTimeMetadataContentIdentifier } + [contentID]
 
-        var streams: [(AVAssetReaderTrackOutput, AVAssetWriterInput)] = []
+        var streams: [(output: AVAssetReaderTrackOutput, input: AVAssetWriterInput, isVideo: Bool)] = []
         for type in [AVMediaType.video, .audio] {
-            for track in try await asset.loadTracks(withMediaType: type) {
+            let tracks = try await asset.loadTracks(withMediaType: type)
+            for track in tracks {
+                guard (try? await track.load(.isEnabled)) ?? true else { continue }
                 let descriptions = try await track.load(.formatDescriptions)
+                guard let hint = descriptions.first else { continue }
                 let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
                 output.alwaysCopiesSampleData = false
-                let input = AVAssetWriterInput(mediaType: type, outputSettings: nil, sourceFormatHint: descriptions.first)
+                let input = AVAssetWriterInput(mediaType: type, outputSettings: nil, sourceFormatHint: hint)
                 input.expectsMediaDataInRealTime = false
                 if type == .video { input.transform = try await track.load(.preferredTransform) }
-                guard reader.canAdd(output), writer.canAdd(input) else { throw LivePhotoPairingError.unsupported }
+                guard reader.canAdd(output), writer.canAdd(input) else { continue }
                 reader.add(output)
                 writer.add(input)
-                streams.append((output, input))
+                streams.append((output, input, type == .video))
+                break
             }
         }
-        guard streams.contains(where: { $0.1.mediaType == .video }) else { throw LivePhotoPairingError.unsupported }
+        guard streams.contains(where: \.isVideo) else { throw LivePhotoPairingError.unsupported }
         var description: CMFormatDescription?
         let specification: [String: Any] = [
             kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier as String: "mdta/com.apple.quicktime.still-image-time",
@@ -110,25 +118,95 @@ enum LivePhotoPairer {
         let adaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
         guard writer.canAdd(metadataInput) else { throw LivePhotoPairingError.unsupported }
         writer.add(metadataInput)
-        guard writer.startWriting(), reader.startReading() else { throw writer.error ?? reader.error ?? LivePhotoPairingError.unsupported }
-        writer.startSession(atSourceTime: .zero)
-        let time = AVMutableMetadataItem()
-        time.keySpace = .quickTimeMetadata
-        time.key = "com.apple.quicktime.still-image-time" as NSString
-        time.value = NSNumber(value: Int8(0))
-        time.dataType = kCMMetadataBaseDataType_SInt8 as String
-        guard adaptor.append(AVTimedMetadataGroup(items: [time], timeRange: CMTimeRange(start: .zero, duration: CMTime(value: 1, timescale: 30)))) else {
-            reader.cancelReading(); writer.cancelWriting(); throw LivePhotoPairingError.unsupported
+        guard writer.startWriting() else { throw writer.error ?? LivePhotoPairingError.unsupported }
+        guard reader.startReading() else {
+            writer.cancelWriting()
+            throw reader.error ?? LivePhotoPairingError.unsupported
         }
-        metadataInput.markAsFinished()
+
+        // Pull the first valid (non-marker) sample of each stream serially to
+        // align startSession and still-image-time with the source timeline.
+        func nextValidSample(from output: AVAssetReaderTrackOutput) throws -> CMSampleBuffer? {
+            while let sample = output.copyNextSampleBuffer() {
+                if CMSampleBufferGetNumSamples(sample) > 0 { return sample }
+            }
+            if reader.status == .failed { throw reader.error ?? LivePhotoPairingError.unsupported }
+            return nil
+        }
+
         do {
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                for (output, input) in streams {
-                    group.addTask {
-                        try await copySamples(output: output, input: input, reader: reader, writer: writer)
+            var pending: [CMSampleBuffer?] = []
+            var finished: [Bool] = []
+            var sessionStart: CMTime?
+            var videoStart: CMTime?
+            for stream in streams {
+                let first = try nextValidSample(from: stream.output)
+                pending.append(first)
+                finished.append(first == nil)
+                if let first {
+                    let pts = CMSampleBufferGetPresentationTimeStamp(first)
+                    if pts.isValid && pts.isNumeric {
+                        if let current = sessionStart {
+                            if CMTimeCompare(pts, current) < 0 { sessionStart = pts }
+                        } else {
+                            sessionStart = pts
+                        }
+                        if stream.isVideo, videoStart == nil { videoStart = pts }
                     }
                 }
-                try await group.waitForAll()
+            }
+            let start = sessionStart ?? .zero
+            let stillStart = videoStart ?? start
+            writer.startSession(atSourceTime: start)
+            let time = AVMutableMetadataItem()
+            time.keySpace = .quickTimeMetadata
+            time.key = "com.apple.quicktime.still-image-time" as NSString
+            time.value = NSNumber(value: Int8(0))
+            time.dataType = kCMMetadataBaseDataType_SInt8 as String
+            while !metadataInput.isReadyForMoreMediaData {
+                try Task.checkCancellation()
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard adaptor.append(AVTimedMetadataGroup(items: [time], timeRange: CMTimeRange(start: stillStart, duration: CMTime(value: 1, timescale: 30)))) else {
+                throw writer.error ?? LivePhotoPairingError.unsupported
+            }
+            metadataInput.markAsFinished()
+
+            // Single-threaded serial pump across tracks: AVAssetReader is not
+            // thread-safe for concurrent track reads.
+            while finished.contains(false) {
+                try Task.checkCancellation()
+                guard writer.status == .writing else { throw writer.error ?? LivePhotoPairingError.unsupported }
+                var progressed = false
+                for index in streams.indices where !finished[index] {
+                    let stream = streams[index]
+                    while stream.input.isReadyForMoreMediaData {
+                        try Task.checkCancellation()
+                        let sample: CMSampleBuffer?
+                        if let buffered = pending[index] {
+                            pending[index] = nil
+                            sample = buffered
+                        } else {
+                            sample = try nextValidSample(from: stream.output)
+                        }
+                        guard let sample else {
+                            if writer.status == .writing { stream.input.markAsFinished() }
+                            finished[index] = true
+                            progressed = true
+                            break
+                        }
+                        guard stream.input.append(sample) else {
+                            throw writer.error ?? LivePhotoPairingError.unsupported
+                        }
+                        progressed = true
+                    }
+                }
+                if !progressed {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+            }
+            for index in streams.indices where !finished[index] && writer.status == .writing {
+                streams[index].input.markAsFinished()
             }
             try Task.checkCancellation()
             guard reader.status == .completed else { throw reader.error ?? LivePhotoPairingError.unsupported }
@@ -140,26 +218,6 @@ enum LivePhotoPairer {
             throw error
         }
     }
-
-    private static func copySamples(output: AVAssetReaderTrackOutput, input: AVAssetWriterInput,
-                                    reader: AVAssetReader, writer: AVAssetWriter) async throws {
-        // Each track has one consumer; nil output settings pass compressed
-        // samples and their format descriptions through without transcoding.
-        defer { input.markAsFinished() }
-        while true {
-            try Task.checkCancellation()
-            guard writer.status == .writing else { throw writer.error ?? LivePhotoPairingError.unsupported }
-            if !input.isReadyForMoreMediaData {
-                try await Task.sleep(for: .milliseconds(10))
-                continue
-            }
-            guard let sample = output.copyNextSampleBuffer() else {
-                if reader.status == .failed { throw reader.error ?? LivePhotoPairingError.unsupported }
-                return
-            }
-            guard input.append(sample) else { throw writer.error ?? LivePhotoPairingError.unsupported }
-        }
-    }
 }
 
 /// APP1/TIFF editing without decoding or re-encoding JPEG image data.
@@ -168,12 +226,18 @@ enum JPEGPairingMetadata {
         let bytes = [UInt8](jpeg)
         guard bytes.count > 4, bytes[0...1] == [0xFF, 0xD8] else { throw LivePhotoPairingError.unsupported }
         var position = 2
+        var insertOffset = 2
         while position + 4 <= bytes.count {
             guard bytes[position] == 0xFF else { throw LivePhotoPairingError.unsupported }
+            while position + 1 < bytes.count && bytes[position + 1] == 0xFF { position += 1 }
+            guard position + 3 < bytes.count else { break }
             let marker = bytes[position + 1]
             if marker == 0xDA || marker == 0xD9 { break }
             let length = Int(bytes[position + 2]) << 8 | Int(bytes[position + 3])
             guard length >= 2, position + 2 + length <= bytes.count else { throw LivePhotoPairingError.unsupported }
+            if marker == 0xE0, insertOffset == 2 {
+                insertOffset = position + 2 + length
+            }
             if marker == 0xE1, length >= 8,
                Array(bytes[(position + 4)..<(position + 10)]) == [69, 120, 105, 102, 0, 0] {
                 let tiff = Data(bytes[(position + 10)..<(position + 2 + length)])
@@ -184,7 +248,7 @@ enum JPEGPairingMetadata {
             position += 2 + length
         }
         let tiff = Data([0x4D, 0x4D, 0, 42, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0])
-        return Data(bytes[..<2]) + (try exifSegment(amendTIFF(tiff, identifier: identifier))) + Data(bytes[2...])
+        return Data(bytes[..<insertOffset]) + (try exifSegment(amendTIFF(tiff, identifier: identifier))) + Data(bytes[insertOffset...])
     }
 
     private static func exifSegment(_ tiff: Data) throws -> Data {
@@ -207,14 +271,19 @@ enum JPEGPairingMetadata {
             let result = (0..<count).map { UInt8((value >> (($0) * 8)) & 255) }
             return little ? result : result.reversed()
         }
-        func entries(_ offset: Int) throws -> ([[UInt8]], [UInt8]) {
+        func entries(_ offset: Int, allowMissingNextIFD: Bool = false) throws -> ([[UInt8]], [UInt8]) {
             let count = try number(offset, 2)
-            guard count <= 4096, offset + 2 + count * 12 + 4 <= bytes.count else { throw LivePhotoPairingError.unsupported }
+            let entriesEnd = offset + 2 + count * 12
+            guard count <= 4096, entriesEnd <= bytes.count else { throw LivePhotoPairingError.unsupported }
             let result = (0..<count).map { index -> [UInt8] in
                 let start = offset + 2 + index * 12
                 return Array(bytes[start..<(start + 12)])
             }
-            return (result, Array(bytes[(offset + 2 + count * 12)..<(offset + 6 + count * 12)]))
+            if entriesEnd + 4 <= bytes.count {
+                return (result, Array(bytes[entriesEnd..<(entriesEnd + 4)]))
+            }
+            guard allowMissingNextIFD else { throw LivePhotoPairingError.unsupported }
+            return (result, [0, 0, 0, 0])
         }
         func tag(_ entry: [UInt8]) -> Int { little ? Int(entry[0]) | Int(entry[1]) << 8 : Int(entry[0]) << 8 | Int(entry[1]) }
         let rootOffset = try number(4, 4)
@@ -223,7 +292,7 @@ enum JPEGPairingMetadata {
         if let pointer = root.first(where: { tag($0) == 0x8769 }) {
             let pointerBytes = little ? Array(pointer[8..<12].reversed()) : Array(pointer[8..<12])
             let offset = pointerBytes.reduce(0) { ($0 << 8) | Int($1) }
-            exifEntries = try entries(offset).0
+            exifEntries = try entries(offset, allowMissingNextIFD: true).0
         }
         // Never discard an unknown MakerNote. Apple images with an existing
         // content ID take the unchanged-image path before reaching this code.

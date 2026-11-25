@@ -7,15 +7,19 @@ import UniformTypeIdentifiers
 /// main app acknowledges the request after it has persisted the task, so a
 /// failed handoff never loses the share and never double-submits it.
 final class ShareViewController: UIViewController {
+    private static let brandCoral = UIColor(red: 1.0, green: 0.141, blue: 0.259, alpha: 1)
+
     private let titleLabel = UILabel()
     private let statusLabel = UILabel()
     private let previewLabel = UILabel()
     private let actionStack = UIStackView()
     private let spinner = UIActivityIndicatorView(style: .medium)
+    private let cancelButton = UIButton(type: .system)
 
     private var didFinish = false
     private var sharedText = ""
     private var submittedRequest: ImportRequest?
+    private var receiveTask: Task<Void, Never>?
     private let confirmationFeedback = UIImpactFeedbackGenerator(style: .light)
     private let resultFeedback = UINotificationFeedbackGenerator()
 
@@ -27,8 +31,10 @@ final class ShareViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
+        view.tintColor = Self.brandCoral
         configureViews()
-        Task { await receive() }
+        spinner.startAnimating()
+        receiveTask = Task { await receive() }
     }
 
     // MARK: - Layout
@@ -57,20 +63,49 @@ final class ShareViewController: UIViewController {
         actionStack.spacing = 12
         actionStack.distribution = .fillEqually
 
-        let cancel = UIButton(type: .system)
-        cancel.setTitle(text("取消", "Cancel"), for: .normal)
-        cancel.addTarget(self, action: #selector(finish), for: .touchUpInside)
+        cancelButton.setTitle(text("取消", "Cancel"), for: .normal)
+        cancelButton.tintColor = Self.brandCoral
+        cancelButton.titleLabel?.font = .preferredFont(forTextStyle: .body)
+        cancelButton.titleLabel?.adjustsFontForContentSizeCategory = true
+        cancelButton.addTarget(self, action: #selector(finish), for: .touchUpInside)
 
-        let stack = UIStackView(arrangedSubviews: [titleLabel, previewLabel, statusLabel, actionStack, spinner, cancel])
+        let scrollView = UIScrollView()
+        scrollView.alwaysBounceVertical = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        let contentView = UIView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, previewLabel, statusLabel, actionStack, spinner, cancelButton])
         stack.axis = .vertical
         stack.spacing = 18
         stack.alignment = .fill
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+
+        view.addSubview(scrollView)
+        scrollView.addSubview(contentView)
+        contentView.addSubview(stack)
+
+        let centerY = stack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+        centerY.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            stack.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
-            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 28),
-            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -28)
+            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
+
+            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+            contentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.frameLayoutGuide.heightAnchor),
+
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
+            stack.topAnchor.constraint(greaterThanOrEqualTo: contentView.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -20),
+            centerY
         ])
     }
 
@@ -87,7 +122,7 @@ final class ShareViewController: UIViewController {
             configuration.image = UIImage(systemName: symbol)
             configuration.imagePadding = 8
             configuration.cornerStyle = .medium
-            configuration.baseBackgroundColor = behavior == .direct ? .systemPink : .secondarySystemBackground
+            configuration.baseBackgroundColor = behavior == .direct ? Self.brandCoral : .secondarySystemBackground
             configuration.baseForegroundColor = behavior == .direct ? .white : .label
             let button = UIButton(configuration: configuration)
             button.addAction(UIAction { [weak self] _ in self?.submit(behavior) }, for: .touchUpInside)
@@ -95,37 +130,61 @@ final class ShareViewController: UIViewController {
             button.titleLabel?.adjustsFontForContentSizeCategory = true
             actionStack.addArrangedSubview(button)
         }
+        if UIAccessibility.isReduceMotionEnabled {
+            view.layoutIfNeeded()
+        } else {
+            UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
+                self.view.layoutIfNeeded()
+            }
+        }
     }
 
     // MARK: - Receive
 
     private func receive() async {
+        defer { spinner.stopAnimating() }
         let items = extensionContext?.inputItems as? [NSExtensionItem] ?? []
-        var values = items.compactMap { $0.attributedContentText?.string }
+        var values = items
+            .compactMap { $0.attributedContentText?.string.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         // Read both representations in a stable order: URL-only representations
         // can discard the share caption and security parameters.
         for provider in items.flatMap({ $0.attachments ?? [] }) {
+            guard !Task.isCancelled else { return }
             for type in [UTType.plainText.identifier, UTType.url.identifier]
             where provider.hasItemConformingToTypeIdentifier(type) {
                 let value: String? = await withCheckedContinuation { continuation in
                     provider.loadItem(forTypeIdentifier: type, options: nil) { item, _ in
-                        if let url = item as? URL { continuation.resume(returning: url.absoluteString) }
-                        else if let data = item as? Data { continuation.resume(returning: String(data: data, encoding: .utf8)) }
-                        else { continuation.resume(returning: item as? String) }
+                        if let url = item as? URL {
+                            continuation.resume(returning: url.isFileURL ? nil : url.absoluteString)
+                        } else if let data = item as? Data, data.count <= 131_072 {
+                            continuation.resume(returning: String(data: data, encoding: .utf8))
+                        } else if let text = item as? String {
+                            continuation.resume(returning: String(text.prefix(32_768)))
+                        } else {
+                            continuation.resume(returning: nil)
+                        }
                     }
                 }
-                if let value, !value.isEmpty, !values.contains(value) { values.append(value) }
+                if let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !trimmed.isEmpty, !values.contains(trimmed) {
+                    values.append(trimmed)
+                }
             }
         }
+        guard !Task.isCancelled else { return }
         guard !values.isEmpty else {
             statusLabel.text = text("没有收到可用的链接或文字。", "No link or text was received.")
             return
         }
         sharedText = values.joined(separator: "\n")
         let count = ImportText.linkCount(in: sharedText)
-        previewLabel.text = count == 0
-            ? String(sharedText.prefix(120))
-            : text("识别到 \(count) 个笔记链接", "Found \(count) note link(s)")
+        guard count > 0 else {
+            previewLabel.text = String(sharedText.prefix(120))
+            statusLabel.text = text("未识别到有效的小红书笔记链接。", "No valid Xiaohongshu note link was found.")
+            return
+        }
+        previewLabel.text = text("识别到 \(count) 个笔记链接", "Found \(count) note link(s)")
         statusLabel.text = text("选择要执行的动作", "Choose what to do")
         addActions()
     }
@@ -140,6 +199,7 @@ final class ShareViewController: UIViewController {
             return
         }
         actionStack.isUserInteractionEnabled = false
+        actionStack.alpha = 0.5
         spinner.startAnimating()
         let request = ImportRequest(text: sharedText, source: .share, behavior: behavior)
         do {
@@ -147,6 +207,7 @@ final class ShareViewController: UIViewController {
         } catch {
             spinner.stopAnimating()
             actionStack.isUserInteractionEnabled = true
+            actionStack.alpha = 1
             statusLabel.text = text("无法保存分享，请重试：", "Could not save share. Please retry: ") + error.localizedDescription
             if feedbackEnabled { resultFeedback.notificationOccurred(.error) }
             return
@@ -168,6 +229,9 @@ final class ShareViewController: UIViewController {
 
     private func showRetainedRequest() {
         spinner.stopAnimating()
+        actionStack.isUserInteractionEnabled = false
+        actionStack.alpha = 0.5
+        cancelButton.setTitle(text("完成", "Done"), for: .normal)
         statusLabel.text = text(
             "已加入，打开应用继续。若未自动跳转，请打开小红书下载器，任务会自动加入。",
             "Added. Open the app to continue. If it did not open, open XHS Downloader and the task will be added."
@@ -177,6 +241,8 @@ final class ShareViewController: UIViewController {
     @objc private func finish() {
         guard !didFinish else { return }
         didFinish = true
+        receiveTask?.cancel()
+        receiveTask = nil
         extensionContext?.completeRequest(returningItems: nil)
     }
 

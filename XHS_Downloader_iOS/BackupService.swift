@@ -74,6 +74,48 @@ struct BackupSettings: Codable, Hashable {
     var namingEnabled: Bool
     var namingTemplate: String
     var namingTimeZone: String
+
+    init(policy: DownloadPolicy = DownloadPolicy(),
+         livePhotoMode: LivePhotoMode = .merged,
+         selectiveDownload: Bool = false,
+         notifications: Bool = false,
+         debugNotifications: Bool = false,
+         haptics: Bool = true,
+         appearance: String = "system",
+         keepScreenAwake: Bool = false,
+         clipboardSuggestions: Bool = false,
+         namingEnabled: Bool = false,
+         namingTemplate: String = NamingFormatter.defaultTemplate,
+         namingTimeZone: String = TimeZone.current.identifier) {
+        self.policy = policy
+        self.livePhotoMode = livePhotoMode
+        self.selectiveDownload = selectiveDownload
+        self.notifications = notifications
+        self.debugNotifications = debugNotifications
+        self.haptics = haptics
+        self.appearance = appearance
+        self.keepScreenAwake = keepScreenAwake
+        self.clipboardSuggestions = clipboardSuggestions
+        self.namingEnabled = namingEnabled
+        self.namingTemplate = namingTemplate
+        self.namingTimeZone = namingTimeZone
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        policy = try c.decodeIfPresent(DownloadPolicy.self, forKey: .policy) ?? DownloadPolicy()
+        livePhotoMode = try c.decodeIfPresent(LivePhotoMode.self, forKey: .livePhotoMode) ?? .merged
+        selectiveDownload = try c.decodeIfPresent(Bool.self, forKey: .selectiveDownload) ?? false
+        notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? false
+        debugNotifications = try c.decodeIfPresent(Bool.self, forKey: .debugNotifications) ?? false
+        haptics = try c.decodeIfPresent(Bool.self, forKey: .haptics) ?? true
+        appearance = try c.decodeIfPresent(String.self, forKey: .appearance) ?? "system"
+        keepScreenAwake = try c.decodeIfPresent(Bool.self, forKey: .keepScreenAwake) ?? false
+        clipboardSuggestions = try c.decodeIfPresent(Bool.self, forKey: .clipboardSuggestions) ?? false
+        namingEnabled = try c.decodeIfPresent(Bool.self, forKey: .namingEnabled) ?? policy.namingEnabled
+        namingTemplate = try c.decodeIfPresent(String.self, forKey: .namingTemplate) ?? policy.namingTemplate
+        namingTimeZone = try c.decodeIfPresent(String.self, forKey: .namingTimeZone) ?? policy.namingTimezone
+    }
 }
 
 /// Avatar bytes travel with the backup so a restored library still has author
@@ -117,6 +159,7 @@ struct BackupEntry: Codable {
         copy.normalizedURL = Self.redactedURL(copy.normalizedURL)
         copy.noteKey = copy.noteKey.map(Self.portableNoteKey)
         copy.archiveTextPaths = nil
+        copy.reusedArchiveTextPaths = nil
         if let note = copy.resolvedNote {
             copy.resolvedNote = ResolvedNote(
                 noteID: note.noteID,
@@ -136,6 +179,7 @@ struct BackupEntry: Codable {
         copy.id = portableNoteKey(note.id)
         copy.canonicalURL = redactedURL(note.canonicalURL)
         copy.archiveTextPaths = []
+        copy.reusedArchiveTextPaths = nil
         copy.archiveGrants = nil
         copy.metadata = redactedMetadata(note.metadata)
         copy.mediaAssets = note.mediaAssets.map(redactedAsset)
@@ -160,6 +204,7 @@ struct BackupEntry: Codable {
     static func redactedAsset(_ asset: MediaAssetRecord) -> MediaAssetRecord {
         var clean = asset
         clean.filesPaths = nil
+        clean.reusedFilesPaths = nil
         if clean.localIdentifier.hasPrefix("file:") { clean.localIdentifier = "file:" }
         return clean
     }
@@ -253,7 +298,12 @@ actor BackupService {
         document.likedNotes = library.likedNotes.map(BackupEntry.portableNoteKey).sorted()
         document.bookmarkedNotes = library.bookmarkedNotes.map(BackupEntry.portableNoteKey).sorted()
         document.authorRemarks = library.authorRemarks
-        document.settings = library.settings
+        if var sanitizedSettings = library.settings {
+            // Defense in depth: never write proxy credentials or device bookmarks.
+            sanitizedSettings.policy.proxy = ""
+            sanitizedSettings.policy.filesBookmark = nil
+            document.settings = sanitizedSettings
+        }
         document.avatars = await Self.collectAvatars(library.notes)
         let data = try encoder.encode(document)
         let url = directory.appendingPathComponent("xhs-notes-\(Self.stamp()).json")
@@ -284,6 +334,7 @@ actor BackupService {
 
     func exportCSV(_ tasks: [DownloadTaskRecord]) throws -> URL {
         let directory = try makeExportDirectory()
+        let formatter = ISO8601DateFormatter()
         var rows = ["id,title,note_id,url,author,red_id,status,type,media,saved,failed,created_at,updated_at"]
         for task in tasks {
             let fields = [
@@ -298,8 +349,8 @@ actor BackupService {
                 String(task.mediaCount),
                 String(task.savedCount),
                 String(task.failedCount),
-                ISO8601DateFormatter().string(from: task.createdAt),
-                ISO8601DateFormatter().string(from: task.updatedAt)
+                formatter.string(from: task.createdAt),
+                formatter.string(from: task.updatedAt)
             ]
             rows.append(fields.map(Self.escapeCSV).joined(separator: ","))
         }
@@ -365,9 +416,10 @@ actor BackupService {
                 }
 
                 // Photos is the remaining source. It is also consulted when a
-                // recorded component is missing, so a half-archived Live Photo can
-                // still be completed from the library.
-                let needsPhotos = exported.isEmpty || missingPath
+                // recorded component is missing or a Live Photo only archived
+                // one component, so a half-archived Live Photo can still be
+                // completed from the library.
+                let needsPhotos = exported.isEmpty || missingPath || ((asset.isLive ?? false) && exported.count < 2)
                 if needsPhotos, !asset.localIdentifier.hasPrefix("file:"), !asset.localIdentifier.isEmpty {
                     let scratchDirectory = directory.appendingPathComponent("scratch-\(UUID().uuidString)", isDirectory: true)
                     scratch.append(scratchDirectory)
@@ -440,8 +492,12 @@ actor BackupService {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let data = try Data(contentsOf: url)
+        guard let rawObject = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              !Set(rawObject.keys).isDisjoint(with: ["version", "tasks", "notes", "collections", "likedNotes", "settings"]) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
         let document = try decoder.decode(BackupDocument.self, from: data)
-        guard document.version <= BackupDocument.currentVersion else {
+        guard (1...BackupDocument.currentVersion).contains(document.version) else {
             throw BackupError.unsupportedVersion(document.version)
         }
         return document
@@ -517,8 +573,12 @@ actor BackupService {
     }
 
     private static func escapeCSV(_ value: String) -> String {
-        guard value.contains(",") || value.contains("\"") || value.contains("\n") else { return value }
-        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        var safe = value
+        if let first = safe.first, "=+-@\t\r".contains(first) {
+            safe = "'" + safe
+        }
+        guard safe.contains(",") || safe.contains("\"") || safe.contains("\n") || safe.contains("\r") else { return safe }
+        return "\"" + safe.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
     private static func stamp() -> String {
@@ -543,6 +603,8 @@ final class ZipWriter {
         let crc: UInt32
         let size: UInt32
         let offset: UInt32
+        let dosTime: UInt16
+        let dosDate: UInt16
     }
 
     private let handle: FileHandle
@@ -557,8 +619,59 @@ final class ZipWriter {
     deinit { try? handle.close() }
 
     func add(file: URL, name: String) throws {
-        let data = try Data(contentsOf: file, options: [.mappedIfSafe])
-        try add(data: data, name: name, timestamp: (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date())
+        let timestamp = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+        let fileSize = UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        guard entries.count < Int(UInt16.max) else { throw BackupError.zipTooLarge(name) }
+        guard fileSize < UInt64(UInt32.max) else { throw BackupError.zipTooLarge(name) }
+        let nameData = Data(name.utf8)
+        guard nameData.count < Int(UInt16.max) else { throw BackupError.zipTooLarge(name) }
+        let currentOffset = handle.offsetInFile
+        let localHeaderSize = UInt64(30 + nameData.count)
+        guard currentOffset < UInt64(UInt32.max),
+              currentOffset + localHeaderSize + fileSize < UInt64(UInt32.max) else {
+            throw BackupError.zipTooLarge(name)
+        }
+
+        // Stream CRC32 first in 1MB chunks so multi-hundred-MB videos never OOM.
+        let reader = try FileHandle(forReadingFrom: file)
+        defer { try? reader.close() }
+        var crcState: UInt32 = 0xFFFF_FFFF
+        var actualSize: UInt64 = 0
+        let chunkSize = 1024 * 1024
+        while true {
+            let chunk: Data? = try autoreleasepool { try reader.read(upToCount: chunkSize) }
+            guard let chunk, !chunk.isEmpty else { break }
+            crcState = CRC32.update(crcState, with: chunk)
+            actualSize += UInt64(chunk.count)
+            guard actualSize < UInt64(UInt32.max) else { throw BackupError.zipTooLarge(name) }
+        }
+        let crc = crcState ^ 0xFFFF_FFFF
+        let size = UInt32(actualSize)
+        let offset = UInt32(currentOffset)
+        let (time, date) = Self.dosTimestamp(timestamp)
+
+        var header = Data()
+        header.appendLE(UInt32(0x0403_4B50))
+        header.appendLE(UInt16(20))
+        header.appendLE(UInt16(0x0800))
+        header.appendLE(UInt16(0))
+        header.appendLE(time)
+        header.appendLE(date)
+        header.appendLE(crc)
+        header.appendLE(size)
+        header.appendLE(size)
+        header.appendLE(UInt16(nameData.count))
+        header.appendLE(UInt16(0))
+        header.append(nameData)
+        try handle.write(contentsOf: header)
+
+        try reader.seek(toOffset: 0)
+        while true {
+            let chunk: Data? = try autoreleasepool { try reader.read(upToCount: chunkSize) }
+            guard let chunk, !chunk.isEmpty else { break }
+            try handle.write(contentsOf: chunk)
+        }
+        entries.append(Entry(name: nameData, crc: crc, size: size, offset: offset, dosTime: time, dosDate: date))
     }
 
     func add(data: Data, name: String) throws {
@@ -566,12 +679,18 @@ final class ZipWriter {
     }
 
     private func add(data: Data, name: String, timestamp: Date) throws {
-        guard data.count < 0xFFFF_FFFF else { throw BackupError.zipTooLarge(name) }
+        guard entries.count < Int(UInt16.max) else { throw BackupError.zipTooLarge(name) }
+        guard UInt64(data.count) < UInt64(UInt32.max) else { throw BackupError.zipTooLarge(name) }
         let nameData = Data(name.utf8)
-        guard nameData.count < 0xFFFF else { throw BackupError.zipTooLarge(name) }
+        guard nameData.count < Int(UInt16.max) else { throw BackupError.zipTooLarge(name) }
+        let currentOffset = handle.offsetInFile
+        guard currentOffset < UInt64(UInt32.max),
+              currentOffset + UInt64(30 + nameData.count + data.count) < UInt64(UInt32.max) else {
+            throw BackupError.zipTooLarge(name)
+        }
         let crc = CRC32.checksum(data)
         let size = UInt32(data.count)
-        let offset = UInt32(handle.offsetInFile)
+        let offset = UInt32(currentOffset)
         let (time, date) = Self.dosTimestamp(timestamp)
 
         var header = Data()
@@ -589,13 +708,17 @@ final class ZipWriter {
         header.append(nameData)
         try handle.write(contentsOf: header)
         try handle.write(contentsOf: data)
-        entries.append(Entry(name: nameData, crc: crc, size: size, offset: offset))
+        entries.append(Entry(name: nameData, crc: crc, size: size, offset: offset, dosTime: time, dosDate: date))
     }
 
     func close() throws {
         guard !closed else { return }
         closed = true
-        let directoryOffset = UInt32(handle.offsetInFile)
+        let rawOffset = handle.offsetInFile
+        guard rawOffset < UInt64(UInt32.max), entries.count <= Int(UInt16.max) else {
+            throw BackupError.zipTooLarge("archive")
+        }
+        let directoryOffset = UInt32(rawOffset)
         var directory = Data()
         for entry in entries {
             directory.appendLE(UInt32(0x0201_4B50))
@@ -603,8 +726,8 @@ final class ZipWriter {
             directory.appendLE(UInt16(20))
             directory.appendLE(UInt16(0x0800))
             directory.appendLE(UInt16(0))
-            directory.appendLE(UInt16(0))
-            directory.appendLE(UInt16(0))
+            directory.appendLE(entry.dosTime)
+            directory.appendLE(entry.dosDate)
             directory.appendLE(entry.crc)
             directory.appendLE(entry.size)
             directory.appendLE(entry.size)
@@ -616,6 +739,9 @@ final class ZipWriter {
             directory.appendLE(UInt32(0))
             directory.appendLE(entry.offset)
             directory.append(entry.name)
+        }
+        guard UInt64(directory.count) < UInt64(UInt32.max) else {
+            throw BackupError.zipTooLarge("archive")
         }
         try handle.write(contentsOf: directory)
         let directorySize = UInt32(directory.count)
@@ -666,11 +792,15 @@ private enum CRC32 {
         return value
     }
 
-    static func checksum(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFF_FFFF
+    static func update(_ initial: UInt32, with data: Data) -> UInt32 {
+        var crc = initial
         for byte in data {
             crc = table[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8)
         }
-        return crc ^ 0xFFFF_FFFF
+        return crc
+    }
+
+    static func checksum(_ data: Data) -> UInt32 {
+        update(0xFFFF_FFFF, with: data) ^ 0xFFFF_FFFF
     }
 }

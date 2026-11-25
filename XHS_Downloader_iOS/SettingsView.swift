@@ -11,6 +11,7 @@ struct SettingsView: View {
     @ObservedObject private var session = WebSession.shared
 
     @State private var showsBrowser = false
+    @State private var pendingBrowserImport: (BrowserImport, ImportRequest.Behavior)?
     @State private var storage = StorageUsage()
     @State private var statusMessage: String?
 
@@ -38,7 +39,7 @@ struct SettingsView: View {
                                 .contentShape(Capsule())
                         }
                         .buttonStyle(.plain)
-                        .glassEffect(.regular.tint(.coral).interactive(), in: Capsule())
+                        .xhsGlass(tint: .coral, prominent: true, interactive: true, in: Capsule())
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets())
                         .accessibilityIdentifier("settings-sign-in")
@@ -106,23 +107,28 @@ struct SettingsView: View {
                 Task { storage = await SettingsView.loadStorage() }
             }
             .task {
-                storage = await SettingsView.loadStorage()
                 if let loadError = coordinator.loadError, !loadError.isEmpty {
                     statusMessage = L10n.format("library.load.failed", loadError)
                 }
             }
-            .sheet(isPresented: $showsBrowser) {
+            .sheet(isPresented: $showsBrowser, onDismiss: flushPendingBrowserImport) {
                 BrowserView(settings: settings) { importValue, behavior in
-                    switch importValue {
-                    case .page(let payload): coordinator.enqueue(payload, behavior: behavior)
-                    case .link(let text): coordinator.enqueue(text, behavior: behavior)
-                    }
+                    pendingBrowserImport = (importValue, behavior)
                     showsBrowser = false
                 }
             }
             .settingsAlert($statusMessage)
         }
         .tint(.coral)
+    }
+
+    private func flushPendingBrowserImport() {
+        guard let pending = pendingBrowserImport else { return }
+        pendingBrowserImport = nil
+        switch pending.0 {
+        case .page(let payload): coordinator.enqueue(payload, behavior: pending.1)
+        case .link(let text): coordinator.enqueue(text, behavior: pending.1)
+        }
     }
 
     private var accountHeader: some View {
@@ -201,16 +207,30 @@ struct SettingsView: View {
         return await BackupService.shared.usage(previewCacheBytes: previews)
     }
 
-    /// Numeric component comparison: "1.10.0" is newer than "1.9.0".
+    /// Numeric component comparison: "1.10.0" is newer than "1.9.0", and a
+    /// release ("1.0.0") is newer than a pre-release ("1.0.0-beta.1").
     static func isVersion(_ lhs: String, newerThan rhs: String) -> Bool {
-        let left = lhs.split(separator: ".").map { Int($0) ?? 0 }
-        let right = rhs.split(separator: ".").map { Int($0) ?? 0 }
-        for index in 0..<max(left.count, right.count) {
-            let a = index < left.count ? left[index] : 0
-            let b = index < right.count ? right[index] : 0
+        func parse(_ raw: String) -> (numbers: [Int], prerelease: String?) {
+            let withoutBuild = raw.split(separator: "+", maxSplits: 1).first.map(String.init) ?? raw
+            let parts = withoutBuild.split(separator: "-", maxSplits: 1)
+            let core = parts.first.map(String.init) ?? withoutBuild
+            let pre = parts.count > 1 ? String(parts[1]) : nil
+            let numbers = core.split(separator: ".").map { Int($0) ?? 0 }
+            return (numbers, pre)
+        }
+        let left = parse(lhs)
+        let right = parse(rhs)
+        for index in 0..<max(left.numbers.count, right.numbers.count) {
+            let a = index < left.numbers.count ? left.numbers[index] : 0
+            let b = index < right.numbers.count ? right.numbers[index] : 0
             if a != b { return a > b }
         }
-        return false
+        switch (left.prerelease, right.prerelease) {
+        case (nil, .some): return true
+        case (.some, nil), (nil, nil): return false
+        case (.some(let a), .some(let b)):
+            return a.localizedStandardCompare(b) == .orderedDescending
+        }
     }
 }
 
@@ -381,6 +401,7 @@ private struct SettingsSectionBlock<Content: View>: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.cardBackground, in: RoundedRectangle(cornerRadius: XHSDesign.cardRadius, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: XHSDesign.cardRadius, style: .continuous))
             } else {
                 content()
             }
@@ -505,7 +526,9 @@ private struct AccountSettingsView: View {
     @ObservedObject var coordinator: DownloadCoordinator
     @ObservedObject private var session = WebSession.shared
     @State private var showsBrowser = false
+    @State private var pendingBrowserImport: (BrowserImport, ImportRequest.Behavior)?
     @State private var manualCookies: [String: String] = [:]
+    @State private var configuredHosts: Set<String> = []
     @State private var statusMessage: String?
 
     var body: some View {
@@ -546,7 +569,7 @@ private struct AccountSettingsView: View {
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.tint(.coral).interactive(), in: Capsule())
+                .xhsGlass(tint: .coral, prominent: true, interactive: true, in: Capsule())
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets())
             } footer: {
@@ -560,6 +583,7 @@ private struct AccountSettingsView: View {
                     Button(role: .destructive) {
                         Task {
                             await session.logout()
+                            refreshConfiguredHosts()
                             AppFeedback.play(.success)
                         }
                     } label: {
@@ -576,7 +600,7 @@ private struct AccountSettingsView: View {
                         HStack {
                             Text(host).font(.caption.monospaced())
                             Spacer()
-                            if SessionVault.hasCookie(host) {
+                            if configuredHosts.contains(host) {
                                 Label(L10n.text("settings.cookie.present"), systemImage: "checkmark.circle.fill")
                                     .labelStyle(.iconOnly)
                                     .foregroundStyle(.green)
@@ -599,6 +623,7 @@ private struct AccountSettingsView: View {
                                 do {
                                     try SessionVault.set("", host: host)
                                     manualCookies[host] = ""
+                                    configuredHosts.remove(host)
                                     AppFeedback.play(.success)
                                 } catch {
                                     statusMessage = error.localizedDescription
@@ -606,7 +631,7 @@ private struct AccountSettingsView: View {
                                 }
                             }
                             .buttonStyle(.borderless)
-                            .disabled(!SessionVault.hasCookie(host))
+                            .disabled(!configuredHosts.contains(host))
                         }
                         .font(.caption)
                     }
@@ -617,17 +642,28 @@ private struct AccountSettingsView: View {
             }
         }
         .settingsPage(L10n.text("settings.group.account"))
+        .task { refreshConfiguredHosts() }
         .onChange(of: showsBrowser) { _, shown in if shown { AppFeedback.play(.navigation) } }
-        .sheet(isPresented: $showsBrowser) {
+        .sheet(isPresented: $showsBrowser, onDismiss: flushPendingBrowserImport) {
             BrowserView(settings: settings) { importValue, behavior in
-                switch importValue {
-                case .page(let payload): coordinator.enqueue(payload, behavior: behavior)
-                case .link(let text): coordinator.enqueue(text, behavior: behavior)
-                }
+                pendingBrowserImport = (importValue, behavior)
                 showsBrowser = false
             }
         }
         .settingsAlert($statusMessage)
+    }
+
+    private func refreshConfiguredHosts() {
+        configuredHosts = Set(SessionVault.hosts.filter { SessionVault.hasCookie($0) })
+    }
+
+    private func flushPendingBrowserImport() {
+        guard let pending = pendingBrowserImport else { return }
+        pendingBrowserImport = nil
+        switch pending.0 {
+        case .page(let payload): coordinator.enqueue(payload, behavior: pending.1)
+        case .link(let text): coordinator.enqueue(text, behavior: pending.1)
+        }
     }
 
     private func saveCookie(_ host: String) {
@@ -640,6 +676,7 @@ private struct AccountSettingsView: View {
         do {
             try SessionVault.set(value, host: host)
             manualCookies[host] = ""
+            configuredHosts.insert(host)
             AppFeedback.play(.success)
         } catch {
             statusMessage = error.localizedDescription
@@ -718,10 +755,15 @@ private struct MediaSettingsView: View {
 // MARK: - Archive & naming
 
 private struct ArchiveSettingsView: View {
+    private static let previewTimestamp: TimeInterval = 1_762_560_000
+
     @ObservedObject var settings: AppSettings
     @ObservedObject var coordinator: DownloadCoordinator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsDirectoryPicker = false
     @State private var statusMessage: String?
+    @State private var directoryLabel = L10n.text("settings.directory.none")
+    @State private var directoryNeedsAttention = false
 
     private var customNaming: Binding<Bool> { $settings.policy.namingEnabled }
     private var namingTemplate: Binding<String> { $settings.policy.namingTemplate }
@@ -837,12 +879,14 @@ private struct ArchiveSettingsView: View {
                     SettingsRowDivider()
                     SettingsCardRow {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                preset(L10n.text("settings.naming.preset.plain"), "{title}_{index_padded}")
-                                preset(L10n.text("settings.naming.preset.dated"), NamingFormatter.defaultTemplate)
-                                preset(L10n.text("settings.naming.preset.author"), "{username}_{title}_{publishTime}")
+                            XHSGlassContainer(spacing: 8) {
+                                HStack(spacing: 8) {
+                                    preset(L10n.text("settings.naming.preset.plain"), "{title}_{index_padded}")
+                                    preset(L10n.text("settings.naming.preset.dated"), NamingFormatter.defaultTemplate)
+                                    preset(L10n.text("settings.naming.preset.author"), "{username}_{title}_{publishTime}")
+                                }
+                                .padding(.vertical, 2)
                             }
-                            .padding(.vertical, 2)
                         }
                         .scrollClipDisabled()
                     }
@@ -885,12 +929,26 @@ private struct ArchiveSettingsView: View {
             }
         }
         .settingsPage(L10n.text("settings.group.archive"))
-        .animation(.snappy, value: customNaming.wrappedValue)
+        .animation(XHSDesign.animation(reduceMotion, XHSDesign.snappy), value: customNaming.wrappedValue)
+        .task(id: settings.policy.filesBookmark) {
+            refreshDirectoryStatus()
+        }
         .onChange(of: showsDirectoryPicker) { _, shown in if shown { AppFeedback.play(.navigation) } }
         .fileImporter(isPresented: $showsDirectoryPicker, allowedContentTypes: [.folder]) { result in
             handleDirectory(result)
         }
         .settingsAlert($statusMessage)
+    }
+
+    private func refreshDirectoryStatus() {
+        let bookmark = settings.policy.filesBookmark
+        guard bookmark != nil else {
+            directoryLabel = L10n.text("settings.directory.none")
+            directoryNeedsAttention = false
+            return
+        }
+        directoryLabel = ArchiveDirectory.displayPath(bookmark) ?? L10n.text("settings.directory.unavailable")
+        directoryNeedsAttention = !ArchiveDirectory.isUsable(bookmark)
     }
 
     private func preset(_ title: String, _ template: String) -> some View {
@@ -907,16 +965,7 @@ private struct ArchiveSettingsView: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .glassEffect(selected ? .regular.tint(.coral).interactive() : .regular.interactive(), in: Capsule())
-    }
-
-    private var directoryLabel: String {
-        guard settings.policy.filesBookmark != nil else { return L10n.text("settings.directory.none") }
-        return ArchiveDirectory.displayPath(settings.policy.filesBookmark) ?? L10n.text("settings.directory.unavailable")
-    }
-
-    private var directoryNeedsAttention: Bool {
-        settings.policy.filesBookmark != nil && !ArchiveDirectory.isUsable(settings.policy.filesBookmark)
+        .xhsGlass(tint: selected ? .coral : nil, prominent: selected, interactive: true, in: Capsule())
     }
 
     /// The preview uses the same formatter as the download pipeline, so what the
@@ -933,7 +982,7 @@ private struct ArchiveSettingsView: View {
             metadata: metadata,
             fallbackPostId: "65f0000000000000000000aa",
             index: 1,
-            downloadEpochSeconds: Date().timeIntervalSince1970,
+            downloadEpochSeconds: Self.previewTimestamp,
             preferences: preferences
         ) + ".heic"
     }
@@ -963,6 +1012,7 @@ private struct ArchiveSettingsView: View {
 
 private struct NetworkSettingsView: View {
     @ObservedObject var settings: AppSettings
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var proxyCheck: ProxyCheck = .idle
     @State private var requestIntervalBeforeEditing: Double?
 
@@ -1034,7 +1084,10 @@ private struct NetworkSettingsView: View {
             }
         }
         .settingsPage(L10n.text("settings.group.network"))
-        .animation(.snappy, value: proxyCheck)
+        .animation(XHSDesign.animation(reduceMotion, XHSDesign.snappy), value: proxyCheck)
+        .onChange(of: settings.policy.proxy) { _, _ in
+            if proxyCheck != .idle { proxyCheck = .idle }
+        }
     }
 
     private func checkProxy() {
@@ -1120,8 +1173,11 @@ private struct InteractionSettingsView: View {
 private struct StorageSettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var coordinator: DownloadCoordinator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var storage = StorageUsage()
     @State private var exportFile: ExportFile?
+    @State private var pendingExportFile: ExportFile?
+    @State private var activeExportCleanupURL: URL?
     @State private var showsBackupImporter = false
     @State private var backupSummary: BackupImportSummary?
     @State private var isWorking = false
@@ -1199,13 +1255,47 @@ private struct StorageSettingsView: View {
         .settingsPage(L10n.text("settings.group.storage"))
         .task { await refreshStorage() }
         .onChange(of: showsBackupImporter) { _, shown in if shown { AppFeedback.play(.navigation) } }
-        .sheet(item: $exportFile) { file in
+        .onChange(of: statusMessage) { _, message in
+            if message == nil, let pending = pendingExportFile {
+                pendingExportFile = nil
+                presentExport(pending)
+            }
+        }
+        .sheet(item: $exportFile, onDismiss: cleanupExportFile) { file in
             ShareSheet(items: [file.url])
         }
-        .fileImporter(isPresented: $showsBackupImporter, allowedContentTypes: [backupType]) { result in
+        .onDisappear {
+            if exportFile == nil {
+                cleanupExportFile()
+                if let pending = pendingExportFile {
+                    pendingExportFile = nil
+                    removeTemporaryItem(pending.url.deletingLastPathComponent())
+                }
+            }
+        }
+        .fileImporter(isPresented: $showsBackupImporter, allowedContentTypes: [.json, backupType]) { result in
             handleImport(result)
         }
         .settingsAlert($statusMessage)
+    }
+
+    private func presentExport(_ file: ExportFile) {
+        cleanupExportFile()
+        activeExportCleanupURL = file.url.deletingLastPathComponent()
+        exportFile = file
+    }
+
+    private func cleanupExportFile() {
+        guard let directory = activeExportCleanupURL else { return }
+        activeExportCleanupURL = nil
+        removeTemporaryItem(directory)
+    }
+
+    private func removeTemporaryItem(_ url: URL) {
+        let tempRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        let candidate = url.standardizedFileURL.path
+        guard candidate.hasPrefix(tempRoot + "/") else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private var backupType: UTType {
@@ -1230,7 +1320,7 @@ private struct StorageSettingsView: View {
 
     private func refreshStorage() async {
         let usage = await SettingsView.loadStorage()
-        withAnimation(.smooth) { storage = usage }
+        withAnimation(XHSDesign.animation(reduceMotion, .smooth)) { storage = usage }
     }
 
     private enum ExportKind { case json, csv, zip }
@@ -1244,6 +1334,7 @@ private struct StorageSettingsView: View {
             defer { isWorking = false }
             do {
                 let url: URL
+                var incompleteNotice: String?
                 switch kind {
                 case .json:
                     var payload = BackupService.BackupLibraryPayload()
@@ -1260,13 +1351,19 @@ private struct StorageSettingsView: View {
                     let archive = try await BackupService.shared.exportArchive(notes)
                     url = archive.url
                     if !archive.failures.isEmpty {
-                        // An incomplete archive is still offered, but never
-                        // presented as a complete export.
-                        statusMessage = L10n.format("backup.error.missing", archive.failures.count)
+                        // An incomplete archive is still offered, but show the
+                        // warning alert first so it does not race with the share sheet.
+                        incompleteNotice = L10n.format("backup.error.missing", archive.failures.count)
                         AppFeedback.play(.warning)
                     }
                 }
-                exportFile = ExportFile(url: url)
+                let file = ExportFile(url: url)
+                if let incompleteNotice {
+                    pendingExportFile = file
+                    statusMessage = incompleteNotice
+                } else {
+                    presentExport(file)
+                }
             } catch {
                 statusMessage = error.localizedDescription
                 AppFeedback.play(.error)
@@ -1334,6 +1431,7 @@ private struct AboutSettingsView: View {
     @State private var isCheckingUpdate = false
     @State private var isWorking = false
     @State private var exportFile: ExportFile?
+    @State private var activeDiagnosticsURL: URL?
     @State private var statusMessage: String?
 
     var body: some View {
@@ -1371,8 +1469,12 @@ private struct AboutSettingsView: View {
                         Label {
                             Text(L10n.text("settings.about.check_update"))
                         } icon: {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .symbolEffect(.rotate, isActive: isCheckingUpdate)
+                            if #available(iOS 18.0, *) {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .symbolEffect(.rotate, isActive: isCheckingUpdate)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
                         }
                         Spacer()
                         if isCheckingUpdate { ProgressView() }
@@ -1386,12 +1488,46 @@ private struct AboutSettingsView: View {
                 }
                 .disabled(isWorking)
             }
+
+            Section {
+                Link(destination: URL(string: "https://github.com/MiohalationM/XHS_Downloader_iOS/blob/main/LICENSE")!) {
+                    HStack {
+                        Label(L10n.text("settings.about.license"), systemImage: "doc.plaintext")
+                        Spacer(minLength: 8)
+                        Text("GNU AGPL-3.0")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Link(destination: URL(string: "https://github.com/NEORUAA/XHS_Downloader_iOS")!) {
+                    Label("NEORUAA / XHS_Downloader_iOS", systemImage: "arrow.up.right.square")
+                }
+                Link(destination: URL(string: "https://github.com/NEORUAA/XHS_Downloader_Android")!) {
+                    Label("NEORUAA / XHS_Downloader_Android", systemImage: "arrow.up.right.square")
+                }
+                Link(destination: URL(string: "https://github.com/JoeanAmier/XHS-Downloader")!) {
+                    Label("JoeanAmier / XHS-Downloader", systemImage: "arrow.up.right.square")
+                }
+            } header: {
+                Text(L10n.text("settings.about.open_source"))
+            } footer: {
+                Text(L10n.text("settings.about.license_notice"))
+            }
         }
         .settingsPage(L10n.text("settings.about"))
-        .sheet(item: $exportFile) { file in
+        .sheet(item: $exportFile, onDismiss: cleanupDiagnosticsFile) { file in
             ShareSheet(items: [file.url])
         }
+        .onDisappear {
+            if exportFile == nil { cleanupDiagnosticsFile() }
+        }
         .settingsAlert($statusMessage)
+    }
+
+    private func cleanupDiagnosticsFile() {
+        guard let url = activeDiagnosticsURL else { return }
+        activeDiagnosticsURL = nil
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// Diagnostics must never leak credentials: cookies, proxy credentials and
@@ -1410,10 +1546,12 @@ private struct AboutSettingsView: View {
         lines.append("timeout=\(Int(policy.timeout)) retries=\(policy.retries) interval=\(policy.requestInterval)")
         lines.append("proxy=\(policy.proxy.isEmpty ? "none" : "configured") mediaProxy=\(policy.proxyMedia)")
         lines.append("account=\(session.account == nil ? "signed-out" : "signed-in")")
-        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+        let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("xhs-diagnostics-\(Int(Date().timeIntervalSince1970)).txt")
         do {
             try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+            cleanupDiagnosticsFile()
+            activeDiagnosticsURL = file
             exportFile = ExportFile(url: file)
         } catch {
             statusMessage = error.localizedDescription
@@ -1432,8 +1570,21 @@ private struct AboutSettingsView: View {
         }
         var request = URLRequest(url: url, timeoutInterval: 15)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let updateSession: URLSession
+        let ownsSession: Bool
+        if !settings.policy.proxy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let config = try? NetworkPolicy.configuration(settings.policy, media: false) {
+            config.timeoutIntervalForRequest = 15
+            config.timeoutIntervalForResource = 30
+            updateSession = URLSession(configuration: config)
+            ownsSession = true
+        } else {
+            updateSession = .shared
+            ownsSession = false
+        }
+        defer { if ownsSession { updateSession.finishTasksAndInvalidate() } }
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await updateSession.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = object["tag_name"] as? String else {

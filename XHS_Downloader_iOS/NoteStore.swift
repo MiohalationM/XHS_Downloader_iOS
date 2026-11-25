@@ -17,6 +17,9 @@ struct StoredNote: Identifiable, Codable, Hashable {
     var updatedAt: Date
     var mediaAssets: [MediaAssetRecord]
     var archiveTextPaths: [String]
+    /// Caption paths that already existed on disk and were reused via
+    /// `skipExisting`. Note deletion must never unlink pre-existing user files.
+    var reusedArchiveTextPaths: [String]? = nil
     var informationOnly: Bool
     var archiveGrants: [ArchiveGrant]?
 
@@ -31,7 +34,8 @@ struct StoredNote: Identifiable, Codable, Hashable {
          mediaAssets: [MediaAssetRecord] = [],
          archiveTextPaths: [String] = [],
          informationOnly: Bool = false,
-         archiveGrants: [ArchiveGrant]? = nil) {
+         archiveGrants: [ArchiveGrant]? = nil,
+         reusedArchiveTextPaths: [String]? = nil) {
         self.id = id
         self.noteID = noteID
         self.canonicalURL = canonicalURL
@@ -42,6 +46,7 @@ struct StoredNote: Identifiable, Codable, Hashable {
         self.updatedAt = updatedAt
         self.mediaAssets = mediaAssets
         self.archiveTextPaths = archiveTextPaths
+        self.reusedArchiveTextPaths = reusedArchiveTextPaths
         self.informationOnly = informationOnly
         self.archiveGrants = archiveGrants
     }
@@ -92,7 +97,13 @@ actor NoteStore {
     }
 
     func load() -> [StoredNote] {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            if let data = try? Data(contentsOf: backupURL),
+               let notes = try? decoder.decode([StoredNote].self, from: data) {
+                return notes
+            }
+            return []
+        }
         do {
             return try decoder.decode([StoredNote].self, from: Data(contentsOf: fileURL))
         } catch {
@@ -111,7 +122,8 @@ actor NoteStore {
     func save(_ notes: [StoredNote]) throws {
         let directory = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let data = try encoder.encode(notes.sorted { $0.createdAt > $1.createdAt })
+        let sorted = notes.sorted { $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt }
+        let data = try encoder.encode(sorted)
         if FileManager.default.fileExists(atPath: fileURL.path) {
             let previous = try Data(contentsOf: fileURL)
             if (try? decoder.decode([StoredNote].self, from: previous)) != nil {
@@ -145,7 +157,7 @@ actor NoteStore {
 extension NoteLibrary {
     /// Builds feed entries from stored notes instead of from task records, so
     /// removing history only removes work history.
-    static func notes(stored: [StoredNote], media: [LibraryMedia]) -> [LibraryNote] {
+    static func notes(stored: [StoredNote], media: [LibraryMedia], hiddenMediaIDs: Set<String> = []) -> [LibraryNote] {
         let lookup = Dictionary(media.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var used = Set<String>()
         var result: [LibraryNote] = []
@@ -155,17 +167,18 @@ extension NoteLibrary {
                 guard seen.insert(record.localIdentifier).inserted else { return nil }
                 // Files-only saves have no PHAsset: resolve the recorded path so
                 // the note still shows its media without photo permission.
-                if let resolved = LibraryMedia(record: record, lookup: lookup) { return resolved }
-                return lookup[record.localIdentifier]
+                return LibraryMedia(record: record, lookup: lookup)
             }
             used.formUnion(available.map(\.id))
-            guard note.isMeaningful else { continue }
+            let trimmedTitle = note.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedBody = note.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedAuthor = note.metadata.userName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !available.isEmpty || !trimmedBody.isEmpty || !trimmedTitle.isEmpty || !trimmedAuthor.isEmpty else { continue }
             result.append(LibraryNote(
                 id: note.id,
-                title: note.title.isEmpty ? String(note.body.prefix(80)) : note.title,
+                title: trimmedTitle.isEmpty ? String(trimmedBody.prefix(80)) : trimmedTitle,
                 body: note.body,
-                author: note.metadata.userName?.isEmpty == false
-                    ? note.metadata.userName! : L10n.text("feed.author.unknown"),
+                author: trimmedAuthor.isEmpty ? L10n.text("feed.author.unknown") : trimmedAuthor,
                 avatarURL: note.metadata.avatarURL,
                 publishTime: note.metadata.publishTime,
                 topics: note.metadata.topics ?? [],
@@ -178,8 +191,9 @@ extension NoteLibrary {
                 publishedAt: note.metadata.publishedAt
             ))
         }
-        // Photos that no longer have a note stay visible as standalone cards.
-        for asset in media where !used.contains(asset.id) {
+        // Photos that no longer have a note stay visible as standalone cards
+        // unless the user explicitly deleted the note while keeping originals.
+        for asset in media where !used.contains(asset.id) && !hiddenMediaIDs.contains(asset.id) {
             result.append(LibraryNote(id: "asset:" + asset.id,
                                       title: L10n.text(asset.isVideo ? "note.type.video" : asset.isLive ? "note.type.live_photo" : "note.type.image"),
                                       body: "", author: L10n.text("feed.author.saved"), avatarURL: nil,

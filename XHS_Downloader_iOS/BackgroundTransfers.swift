@@ -5,7 +5,7 @@ import UIKit
 /// Delegate state is confined to `events`, including cancellation and reconnect.
 final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     static let shared = BackgroundTransfers()
-    static let sessionIdentifier = "com.neoruaa.xhsdn.media-transfers"
+    static let sessionIdentifier = (Bundle.main.bundleIdentifier ?? "com.neoruaa.xhsdn") + ".media-transfers"
     struct Progress: Sendable { let received: Int64; let expected: Int64; let bytesPerSecond: Double }
     private struct Response: Codable {
         let url: URL
@@ -23,20 +23,26 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
     private let root: URL
     private var session: URLSession!
     private var tasks: [String: URLSessionDownloadTask] = [:]
+    private var completedTaskIDs = Set<Int>()
     private var waiting: [String: Waiting] = [:]
+    private var deferredTokens = Set<UUID>()
     private var cancelled = Set<UUID>()
     private var ready = false
     private var deferred: [() -> Void] = []
     private var lastProgress: [String: (Date, Int64)] = [:]
-    private var handoffCompletion: (() -> Void)?
+    private var handoffCompletions: [() -> Void] = []
     private var backgroundEventsFinished = false
     private var fileErrors: [String: Error] = [:]
 
     private override init() {
-        root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        var directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("BackgroundTransfers", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? directory.setResourceValues(values)
+        root = directory
         super.init()
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: ImportInbox.groupIdentifier) != nil {
             configuration.sharedContainerIdentifier = ImportInbox.groupIdentifier
@@ -52,13 +58,71 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
         session.getAllTasks { tasks in
             self.events.async {
                 for case let task as URLSessionDownloadTask in tasks {
-                    if let key = task.taskDescription { self.tasks[key] = task }
+                    guard !self.completedTaskIDs.contains(task.taskIdentifier),
+                          task.state == .running || task.state == .suspended,
+                          let key = task.taskDescription else { continue }
+                    self.tasks[key] = task
                 }
                 self.ready = true
                 let work = self.deferred
                 self.deferred.removeAll()
                 work.forEach { $0() }
             }
+        }
+    }
+
+    /// Computes the stable disk/session lookup key for a transfer slot + URL.
+    static func transferKey(identity: String, url: URL?) -> String {
+        SHA256.hash(data: Data((identity + "|" + (url?.absoluteString ?? "")).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Returns transfer keys that either have a live system background download
+    /// task or already finished downloading to disk awaiting handoff.
+    func activeTransferKeys() async -> Set<String> {
+        await withCheckedContinuation { continuation in
+            events.async {
+                let collect = {
+                    var keys = Set(self.tasks.keys)
+                    let files = (try? FileManager.default.contentsOfDirectory(at: self.root, includingPropertiesForKeys: nil)) ?? []
+                    for file in files where file.pathExtension == "download" {
+                        let key = file.deletingPathExtension().lastPathComponent
+                        if let data = try? Data(contentsOf: self.path(key, "response")),
+                           let response = try? JSONDecoder().decode(Response.self, from: data),
+                           (200...299).contains(response.status) {
+                            keys.insert(key)
+                        }
+                    }
+                    continuation.resume(returning: keys)
+                }
+                if self.ready { collect() } else { self.deferred.append(collect) }
+            }
+        }
+    }
+
+    /// Cancels any lingering background transfers that have no active caller
+    /// waiting on them (for example after process termination or history clear),
+    /// while leaving transfers in `preservingKeys` untouched so resumed tasks
+    /// can reattach to them.
+    func cancelUnattachedTransfers(preservingKeys: Set<String> = [], clearCache: Bool = false) {
+        events.async {
+            let run = {
+                for (key, task) in self.tasks where self.waiting[key] == nil && !preservingKeys.contains(key) {
+                    task.cancel()
+                    self.tasks[key] = nil
+                    self.lastProgress[key] = nil
+                    if clearCache { self.removeArtifacts(forKey: key) }
+                }
+                if clearCache {
+                    let activeKeys = Set(self.waiting.keys).union(preservingKeys)
+                    let files = (try? FileManager.default.contentsOfDirectory(at: self.root, includingPropertiesForKeys: nil)) ?? []
+                    for file in files {
+                        let key = file.deletingPathExtension().lastPathComponent
+                        if !activeKeys.contains(key) { try? FileManager.default.removeItem(at: file) }
+                    }
+                }
+            }
+            if self.ready { run() } else { self.deferred.append(run) }
         }
     }
 
@@ -74,13 +138,13 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
 
     func download(_ request: URLRequest, identity: String,
                   progress: @escaping @Sendable (Progress) -> Void) async throws -> (URL, URLResponse) {
-        let key = SHA256.hash(data: Data((identity + "|" + (request.url?.absoluteString ?? "")).utf8))
-            .map { String(format: "%02x", $0) }.joined()
+        let key = Self.transferKey(identity: identity, url: request.url)
         let token = UUID()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 events.async {
                     let begin = {
+                        self.deferredTokens.remove(token)
                         if self.cancelled.remove(token) != nil {
                             continuation.resume(throwing: CancellationError())
                             return
@@ -89,6 +153,7 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
                         if FileManager.default.fileExists(atPath: file.path),
                            let data = try? Data(contentsOf: self.path(key, "response")),
                            let response = try? JSONDecoder().decode(Response.self, from: data),
+                           (200...299).contains(response.status),
                            let value = response.value {
                             continuation.resume(returning: (file, value))
                             return
@@ -98,10 +163,13 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
                             return
                         }
                         self.waiting[key] = Waiting(token: token, continuation: continuation, progress: progress)
-                        if let existing = self.tasks[key] {
+                        if let existing = self.tasks[key],
+                           !self.completedTaskIDs.contains(existing.taskIdentifier),
+                           existing.state == .running || existing.state == .suspended {
                             existing.resume()
                             return
                         }
+                        self.tasks[key] = nil
                         let task: URLSessionDownloadTask
                         if let resumeData = try? Data(contentsOf: self.path(key, "resume")) {
                             task = self.session.downloadTask(withResumeData: resumeData)
@@ -111,21 +179,34 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
                         self.tasks[key] = task
                         task.resume()
                     }
-                    if self.ready { begin() } else { self.deferred.append(begin) }
+                    if self.ready {
+                        begin()
+                    } else {
+                        self.deferredTokens.insert(token)
+                        self.deferred.append(begin)
+                    }
                 }
             }
         } onCancel: {
             self.events.async {
-                guard let item = self.waiting[key], item.token == token else {
+                if self.deferredTokens.contains(token) {
                     self.cancelled.insert(token)
                     return
                 }
-                // Keep the URLSession task until didComplete. A new retry cannot
-                // attach to an old task that has not finished cancelling.
-                self.tasks[key]?.cancel { data in
-                    guard let data else { return }
-                    self.events.async { try? data.write(to: self.path(key, "resume"), options: .atomic) }
+                guard let item = self.waiting[key], item.token == token else { return }
+                guard let task = self.tasks[key],
+                      !self.completedTaskIDs.contains(task.taskIdentifier),
+                      task.state == .running || task.state == .suspended else {
+                    self.waiting.removeValue(forKey: key)
+                    self.tasks[key] = nil
+                    self.lastProgress[key] = nil
+                    item.continuation.resume(throwing: CancellationError())
+                    return
                 }
+                // Keep the URLSession task until didComplete. Resume data is
+                // persisted deterministically in didCompleteWithError to avoid
+                // overwriting a fresh retry's resume data.
+                task.cancel(byProducingResumeData: { _ in })
             }
         }
     }
@@ -135,7 +216,7 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
             if self.backgroundEventsFinished {
                 self.backgroundEventsFinished = false
                 DispatchQueue.main.async { completion() }
-            } else { self.handoffCompletion = completion }
+            } else { self.handoffCompletions.append(completion) }
         }
     }
 
@@ -144,6 +225,10 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
         guard let key = downloadTask.taskDescription else { return }
         do {
             guard let response = downloadTask.response as? HTTPURLResponse, let url = response.url else {
+                throw MediaValidationError.invalidResponse
+            }
+            guard (200...299).contains(response.statusCode) else {
+                removeArtifacts(forKey: key)
                 throw MediaValidationError.invalidResponse
             }
             let file = path(key, "download")
@@ -156,9 +241,12 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        completedTaskIDs.insert(task.taskIdentifier)
         guard let key = task.taskDescription else { return }
         let item = waiting.removeValue(forKey: key)
-        tasks[key] = nil
+        if tasks[key]?.taskIdentifier == task.taskIdentifier {
+            tasks[key] = nil
+        }
         lastProgress[key] = nil
         if let error {
             if let data = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
@@ -179,19 +267,31 @@ final class BackgroundTransfers: NSObject, URLSessionDownloadDelegate, @unchecke
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let key = downloadTask.taskDescription else { return }
         let now = Date()
-        let last = lastProgress[key] ?? (now, 0)
-        let interval = now.timeIntervalSince(last.0)
-        guard interval >= 0.25 || totalBytesWritten == totalBytesExpectedToWrite else { return }
-        lastProgress[key] = (now, totalBytesWritten)
-        waiting[key]?.progress(Progress(received: totalBytesWritten, expected: totalBytesExpectedToWrite,
-                                        bytesPerSecond: interval > 0 ? Double(totalBytesWritten - last.1) / interval : 0))
+        if let last = lastProgress[key] {
+            let interval = now.timeIntervalSince(last.0)
+            guard interval >= 0.25 || (totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite) else { return }
+            lastProgress[key] = (now, totalBytesWritten)
+            let delta = max(0, totalBytesWritten - last.1)
+            waiting[key]?.progress(Progress(received: totalBytesWritten, expected: totalBytesExpectedToWrite,
+                                            bytesPerSecond: interval > 0 ? Double(delta) / interval : 0))
+        } else {
+            lastProgress[key] = (now, totalBytesWritten)
+            waiting[key]?.progress(Progress(received: totalBytesWritten, expected: totalBytesExpectedToWrite,
+                                            bytesPerSecond: 0))
+        }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        let completion = handoffCompletion
-        handoffCompletion = nil
-        backgroundEventsFinished = completion == nil
-        DispatchQueue.main.async { completion?() }
+        let completions = handoffCompletions
+        handoffCompletions.removeAll()
+        backgroundEventsFinished = completions.isEmpty
+        DispatchQueue.main.async { completions.forEach { $0() } }
+    }
+
+    private func removeArtifacts(forKey key: String) {
+        try? FileManager.default.removeItem(at: path(key, "download"))
+        try? FileManager.default.removeItem(at: path(key, "response"))
+        try? FileManager.default.removeItem(at: path(key, "resume"))
     }
 
     private func path(_ key: String, _ extensionName: String) -> URL {

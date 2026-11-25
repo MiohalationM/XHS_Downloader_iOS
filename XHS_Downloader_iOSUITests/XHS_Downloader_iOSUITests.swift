@@ -212,6 +212,14 @@ final class XHS_Downloader_iOSUITests: XCTestCase {
             if region == "media" {
                 app.scrollViews["note-media-canvas-\(id)"].swipeLeft()
                 XCTAssertTrue(app.staticTexts["2/2"].waitForExistence(timeout: 5))
+                // Right-swiping inside the media carousel on page 2 flips back
+                // to page 1 instead of dismissing the note.
+                window.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: y))
+                    .press(forDuration: 0.05,
+                           thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: y)),
+                           withVelocity: .slow, thenHoldForDuration: 0.1)
+                XCTAssertTrue(app.staticTexts["1/2"].waitForExistence(timeout: 5))
+                XCTAssertTrue(app.buttons["note-close"].exists)
             }
             if region == "body" {
                 app.scrollViews["note-reader-scroll"].swipeUp(velocity: .slow)
@@ -233,6 +241,20 @@ final class XHS_Downloader_iOSUITests: XCTestCase {
             XCTAssertTrue(card.isHittable, region)
             attachScreenshot("global-return-\(region)")
         }
+        // On photo #2, dragging from the left screen edge returns directly to
+        // library-note-feed without stopping on photo #1.
+        card.tap()
+        XCTAssertTrue(app.buttons["note-close"].waitForExistence(timeout: 5))
+        app.scrollViews["note-media-canvas-\(id)"].swipeLeft()
+        XCTAssertTrue(app.staticTexts["2/2"].waitForExistence(timeout: 5))
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.04, dy: 0.40))
+            .press(forDuration: 0.05,
+                   thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.86, dy: 0.40)),
+                   withVelocity: .slow, thenHoldForDuration: 0.15)
+        XCTAssertTrue(app.buttons["note-close"].waitForNonExistence(timeout: 5), "left-edge-from-page-2")
+        XCTAssertTrue(app.scrollViews["library-note-feed"].waitForExistence(timeout: 5), "left-edge-from-page-2")
+        XCTAssertTrue(card.isHittable, "left-edge-from-page-2")
+        attachScreenshot("global-return-left-edge-page2")
     }
 
     @MainActor
@@ -250,6 +272,8 @@ final class XHS_Downloader_iOSUITests: XCTestCase {
 
         XCTAssertTrue(app.descendants(matching: .any)["task-center-list"].waitForExistence(timeout: 8))
         XCTAssertEqual(XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.count, 0)
+        XCTAssertFalse(app.switches["dashboard-clipboard-toggle"].exists)
+        XCTAssertFalse(app.switches["Download clipboard links automatically"].exists)
         let primaryButton = app.buttons["primary-paste-button"]
         XCTAssertTrue(primaryButton.waitForExistence(timeout: 3))
         let moreButton = app.buttons["more-actions-button"]
@@ -669,8 +693,9 @@ final class XHS_Downloader_iOSUITests: XCTestCase {
         ]
         app.launch()
 
-        // 1. Downloads dashboard, filter chips, task detail, and manual input
+        // 1. Downloads filter chips, task detail, and manual input
         XCTAssertTrue(app.descendants(matching: .any)["task-center-list"].waitForExistence(timeout: 8))
+        XCTAssertFalse(app.switches["dashboard-clipboard-toggle"].exists)
         attachScreenshot("redesign-downloads-populated")
         app.buttons["task-filter-waiting"].tap()
         attachScreenshot("redesign-downloads-filtered-empty")

@@ -48,6 +48,35 @@ struct DownloadPolicy: Codable, Hashable, Sendable {
     var namingTemplate = NamingFormatter.defaultTemplate
     var namingTimezone = TimeZone.current.identifier
 
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = DownloadPolicy()
+        imageFormat = try c.decodeIfPresent(ImagePreference.self, forKey: .imageFormat) ?? d.imageFormat
+        videoPreference = try c.decodeIfPresent(VideoPreference.self, forKey: .videoPreference) ?? d.videoPreference
+        images = try c.decodeIfPresent(Bool.self, forKey: .images) ?? d.images
+        videos = try c.decodeIfPresent(Bool.self, forKey: .videos) ?? d.videos
+        covers = try c.decodeIfPresent(Bool.self, forKey: .covers) ?? d.covers
+        comments = try c.decodeIfPresent(Bool.self, forKey: .comments) ?? d.comments
+        destination = try c.decodeIfPresent(SaveDestination.self, forKey: .destination) ?? d.destination
+        captionFormat = try c.decodeIfPresent(CaptionFormat.self, forKey: .captionFormat) ?? d.captionFormat
+        authorDirectories = try c.decodeIfPresent(Bool.self, forKey: .authorDirectories) ?? d.authorDirectories
+        noteDirectories = try c.decodeIfPresent(Bool.self, forKey: .noteDirectories) ?? d.noteDirectories
+        skipExisting = try c.decodeIfPresent(Bool.self, forKey: .skipExisting) ?? d.skipExisting
+        writePublishTime = try c.decodeIfPresent(Bool.self, forKey: .writePublishTime) ?? d.writePublishTime
+        timeout = try c.decodeIfPresent(Double.self, forKey: .timeout) ?? d.timeout
+        retries = try c.decodeIfPresent(Int.self, forKey: .retries) ?? d.retries
+        requestInterval = try c.decodeIfPresent(Double.self, forKey: .requestInterval) ?? d.requestInterval
+        proxy = try c.decodeIfPresent(String.self, forKey: .proxy) ?? d.proxy
+        proxyMedia = try c.decodeIfPresent(Bool.self, forKey: .proxyMedia) ?? d.proxyMedia
+        useWebSession = try c.decodeIfPresent(Bool.self, forKey: .useWebSession) ?? d.useWebSession
+        filesBookmark = try c.decodeIfPresent(Data.self, forKey: .filesBookmark)
+        namingEnabled = try c.decodeIfPresent(Bool.self, forKey: .namingEnabled) ?? d.namingEnabled
+        namingTemplate = try c.decodeIfPresent(String.self, forKey: .namingTemplate) ?? d.namingTemplate
+        namingTimezone = try c.decodeIfPresent(String.self, forKey: .namingTimezone) ?? d.namingTimezone
+    }
+
     static func load(defaults: UserDefaults = .standard) -> Self {
         guard let data = defaults.data(forKey: "download.policy"),
               let value = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
@@ -72,12 +101,21 @@ struct DownloadPolicy: Codable, Hashable, Sendable {
 struct DestinationResult: Codable, Hashable, Sendable {
     enum State: String, Codable, Sendable { case pending, saved, failed, skipped, unavailable }
     var state: State = .pending
-    /// Photos local identifier, or an absolute path for the Files destination.
+    /// Photos local identifier, or the primary absolute path for the Files destination.
     var reference: String?
+    /// All component paths for multi-file assets (e.g. Live Photo still + motion).
+    var references: [String]?
+    /// Subset of `references` reused via `skipExisting` rather than newly created.
+    var reusedReferences: [String]?
     var error: String?
     var byteCount: Int64?
 
     var isSettled: Bool { state == .saved || state == .skipped }
+
+    var allReferences: [String] {
+        if let references, !references.isEmpty { return references }
+        return reference.map { [$0] } ?? []
+    }
 }
 
 /// A Live Photo has two independent truths: whether the original components are
@@ -135,7 +173,9 @@ extension RemoteMedia {
                     }
                 }
             }
-            result.candidates = ordered.flatMap { [$0.url] + $0.backups }
+            var seen = Set<URL>()
+            let combined = ordered.flatMap { [$0.url] + $0.backups } + candidates
+            result.candidates = combined.filter { seen.insert($0).inserted }
             result.url = result.candidates.first ?? url
         } else if type == .image, policy.imageFormat != .original, let fileKey,
                   var components = URLComponents(string: "https://ci.xiaohongshu.com/\(fileKey)") {

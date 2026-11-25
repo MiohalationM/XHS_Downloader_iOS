@@ -42,7 +42,8 @@ extension XHSDownloader {
 
     func resolveNote(data note: [String: Any], noteID: String, canonicalURL: URL, comments: Any? = nil,
                      naming: NamingContext? = nil) throws -> ResolvedNote {
-        if let actual = firstNonEmptyString(note["noteId"], note["note_id"], note["id"]), actual != noteID {
+        let actual = firstNonEmptyString(note["noteId"], note["note_id"], note["id"])
+        if let actual, actual != noteID {
             throw XHSDownloaderError.parsingFailed
         }
         var metadata = extractMetadata(from: note)
@@ -65,19 +66,25 @@ extension XHSDownloader {
         let epoch = (naming?.downloadInstant ?? Date()).timeIntervalSince1970
         let namingPreferences = naming?.preferences ?? NamingPreferences.load()
         var media: [RemoteMedia] = []
+        var identityCounts: [String: Int] = [:]
 
         func make(_ urls: [String], type: RemoteMedia.MediaType, identity: String,
                   preview: String? = nil, paired: [String] = [], dimensions: [String: Any] = [:]) -> RemoteMedia? {
             var seen = Set<String>()
             let candidates = urls.compactMap(normalizedMediaURL).filter { seen.insert($0.absoluteString).inserted }
             guard let first = candidates.first else { return nil }
+            let count = (identityCounts[identity] ?? 0) + 1
+            identityCounts[identity] = count
+            let uniqueIdentity = count == 1 ? identity : "\(identity)#\(count)"
+            let validPaired = paired.compactMap(normalizedMediaURL)
+            let resolvedType: RemoteMedia.MediaType = type == .livePhoto && validPaired.isEmpty ? .image : type
             return RemoteMedia(
-                stableID: "\(noteID):\(identity)", url: first, type: type,
+                stableID: "\(noteID):\(uniqueIdentity)", url: first, type: resolvedType,
                 fileBaseName: NamingFormatter.makeBaseName(metadata: metadata, fallbackPostId: noteID,
                     index: media.count + 1, downloadEpochSeconds: epoch, preferences: namingPreferences),
                 originalURLString: first.absoluteString, candidates: candidates,
                 previewURL: preview.flatMap(normalizedMediaURL),
-                pairedVideoURLs: paired.compactMap(normalizedMediaURL),
+                pairedVideoURLs: validPaired,
                 width: dimensions["width"] as? Int, height: dimensions["height"] as? Int
             )
         }
@@ -102,16 +109,17 @@ extension XHSDownloader {
             let paired = (stream.map(streamURLs) ?? [])
                 + ((image["video"] as? [String: Any]).map(videoURLs) ?? [])
                 + ((image["livePhoto"] as? [String: Any]).map(videoURLs) ?? [])
+            let validPaired = paired.compactMap(normalizedMediaURL)
             // A stream inside this image is the explicit pairing signal. A note
             // with one image plus an unrelated video is never guessed to be live.
             let identity = firstNonEmptyString(image["traceId"], image["fileId"]) ?? String(index)
-            if var item = make(urls, type: paired.isEmpty ? .image : .livePhoto, identity: "image:\(identity)",
+            if var item = make(urls, type: validPaired.isEmpty ? .image : .livePhoto, identity: "image:\(identity)",
                                preview: firstNonEmptyString(image["urlPre"], image["urlDefault"]) ?? urls.first,
                                paired: paired, dimensions: image) {
                 item.fileKey = imageFileKey(image)
                 // Video notes also expose their cover through imageList. An
                 // explicitly paired Live Photo remains body media.
-                if isVideoNote, paired.isEmpty { item.role = .cover }
+                if isVideoNote, validPaired.isEmpty { item.role = .cover }
                 media.append(item)
             }
         }
@@ -135,6 +143,10 @@ extension XHSDownloader {
             }
         }
         if let comments = comments ?? note["comments"] ?? note["commentData"] { commentImages(comments) }
+        // Reject completely empty shell payloads returned for deleted/login-walled notes.
+        if media.isEmpty, title.isEmpty, body.isEmpty, actual == nil {
+            throw XHSDownloaderError.parsingFailed
+        }
         return ResolvedNote(noteID: noteID, canonicalURL: canonicalURL, title: title, body: body, metadata: metadata, media: media)
     }
 
@@ -147,8 +159,13 @@ extension XHSDownloader {
         }
         let noteRoot = root["note"] as? [String: Any] ?? root
         if let map = noteRoot["noteDetailMap"] as? [String: Any] {
-            if let exact = map[id] as? [String: Any] { return unwrap(exact) }
-            return map.values.compactMap { $0 as? [String: Any] }.map(unwrap).first { matches($0.note) }
+            if let exact = map[id] as? [String: Any] {
+                let unwrapped = unwrap(exact)
+                if !unwrapped.note.isEmpty { return unwrapped }
+            }
+            if let found = map.values.compactMap({ $0 as? [String: Any] }).map(unwrap).first(where: { matches($0.note) }) {
+                return found
+            }
         }
         if let mobile = root["noteData"] as? [String: Any],
            let data = mobile["data"] as? [String: Any],
@@ -164,7 +181,16 @@ extension XHSDownloader {
     private func normalizedMediaURL(_ value: String) -> URL? {
         let string = value.replacingOccurrences(of: "\\/", with: "/")
         let absolute = string.hasPrefix("//") ? "https:" + string : string
-        guard let url = URL(string: absolute), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+        guard let url = URL(string: absolute),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else { return nil }
+        if scheme == "http", let host = url.host?.lowercased(),
+           ["xhscdn.com", "xiaohongshu.com", "rednote.com", "xhslink.com", "xhslink.cn"]
+            .contains(where: { host == $0 || host.hasSuffix("." + $0) }),
+           var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.scheme = "https"
+            return components.url ?? url
+        }
         return url
     }
 
@@ -220,7 +246,8 @@ extension XHSDownloader {
 
     private func videoVariants(_ video: [String: Any]) -> [MediaVariant] {
         var result: [MediaVariant] = []
-        if let consumer = video["consumer"] as? [String: Any], let key = consumer["originVideoKey"] as? String,
+        if let consumer = video["consumer"] as? [String: Any],
+           let key = consumer["originVideoKey"] as? String, !key.isEmpty,
            let url = normalizedMediaURL(key.hasPrefix("http") ? key : "https://sns-video-bd.xhscdn.com/" + key) {
             result.append(MediaVariant(url: url, isOriginal: true))
         }

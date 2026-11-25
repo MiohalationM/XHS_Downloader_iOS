@@ -9,8 +9,9 @@ import Combine
 /// never in preferences, and are cleared when the account is signed out.
 enum SessionVault {
     static let hosts = ["www.xiaohongshu.com", "www.rednote.com"]
+    private static let serviceName = (Bundle.main.bundleIdentifier ?? "com.neoruaa.xhsdn") + ".cookies"
     private static func query(_ host: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "com.neoruaa.xhsdn.cookies",
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: serviceName,
          kSecAttrAccount as String: host]
     }
     static func cookie(_ host: String) -> String {
@@ -29,15 +30,19 @@ enum SessionVault {
     /// pairs are dropped instead of failing the whole entry, and the value is
     /// rejected outright when nothing usable remains.
     static func sanitize(_ raw: String) -> String {
-        let pairs = raw
-            .replacingOccurrences(of: "Cookie:", with: "")
+        let stripped = raw
+            .replacingOccurrences(of: #"(?i)\bcookie\s*:"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\r", with: ";")
             .replacingOccurrences(of: "\n", with: ";")
+        let pairs = stripped
             .split(separator: ";")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { pair in
-                guard let equals = pair.firstIndex(of: "=") else { return false }
+                guard !pair.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                      let equals = pair.firstIndex(of: "=") else { return false }
                 let name = pair[..<equals].trimmingCharacters(in: .whitespaces)
-                return !name.isEmpty && equals < pair.index(before: pair.endIndex)
+                return !name.isEmpty && !name.contains(where: \.isWhitespace)
+                    && equals < pair.index(before: pair.endIndex)
             }
         return pairs.joined(separator: "; ")
     }
@@ -45,7 +50,13 @@ enum SessionVault {
     static func set(_ value: String, host: String) throws {
         let q = query(host)
         let data = Data(value.utf8)
-        if value.isEmpty { SecItemDelete(q as CFDictionary); return }
+        if value.isEmpty {
+            let status = SecItemDelete(q as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+            }
+            return
+        }
         let result = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if result == errSecItemNotFound {
             var insert = q
@@ -68,15 +79,16 @@ enum ProxyConfigurationError: LocalizedError {
 
 enum NetworkPolicy {
     static func proxy(_ value: String) throws -> ProxyConfiguration? {
-        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        guard let c = URLComponents(string: value), let host = c.host, !host.isEmpty,
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let c = URLComponents(string: trimmed), let host = c.host, !host.isEmpty,
               let port = c.port, (1...65535).contains(port),
               c.user == nil, c.password == nil, c.query == nil, c.fragment == nil,
-              c.path.isEmpty, ["http", "socks5"].contains(c.scheme?.lowercased() ?? "") else {
+              c.path.isEmpty, let scheme = c.scheme?.lowercased(), ["http", "socks5"].contains(scheme) else {
             throw ProxyConfigurationError.invalid(L10n.text("network.proxy.invalid"))
         }
         let endpoint = NWEndpoint.hostPort(host: .init(host), port: .init(rawValue: UInt16(port))!)
-        return c.scheme == "socks5" ? ProxyConfiguration(socksv5Proxy: endpoint) :
+        return scheme == "socks5" ? ProxyConfiguration(socksv5Proxy: endpoint) :
             ProxyConfiguration(httpCONNECTProxy: endpoint)
     }
     static func configuration(_ policy: DownloadPolicy, media: Bool = false) throws -> URLSessionConfiguration {
@@ -89,7 +101,7 @@ enum NetworkPolicy {
     }
 }
 
-struct SignedInAccount: Codable {
+struct SignedInAccount: Codable, Equatable {
     var name: String
     var uid: String?
     var redID: String?
@@ -109,7 +121,16 @@ final class WebSession: ObservableObject {
     }
     func synchronize() async {
         let cookies = await dataStore.httpCookieStore.allCookies()
-        for cookie in cookies where Self.trusted(cookie.domain) {
+        let trustedCookies = cookies.filter { Self.trusted($0.domain) }
+        struct CookieKey: Hashable { let domain: String; let path: String; let name: String }
+        let liveKeys = Set(trustedCookies.map { CookieKey(domain: $0.domain.lowercased(), path: $0.path, name: $0.name) })
+        for existing in HTTPCookieStorage.shared.cookies ?? [] where Self.trusted(existing.domain) {
+            let key = CookieKey(domain: existing.domain.lowercased(), path: existing.path, name: existing.name)
+            if !liveKeys.contains(key) {
+                HTTPCookieStorage.shared.deleteCookie(existing)
+            }
+        }
+        for cookie in trustedCookies {
             HTTPCookieStorage.shared.setCookie(cookie)
         }
     }
@@ -124,30 +145,51 @@ final class WebSession: ObservableObject {
         guard let host = webView.url?.host, Self.trusted(host) else { return }
         let script = """
         (() => {
-          const s=window.__INITIAL_STATE__; if(!s) return null;
+          const s=window.__INITIAL_STATE__; if(!s || !s.user) return null;
           const un=v=>v?._rawValue??v?.value??v;
-          if(un(s.user?.loggedIn)!==true) return null;
+          const loggedIn=un(s.user?.loggedIn);
           const u=un(s.user?.userInfo);
-          if(!u || u.guest===true || !u.userId) return null;
+          if(loggedIn===false || u?.guest===true) return JSON.stringify({loggedOut:true});
+          if(loggedIn!==true || !u) return null;
+          const uid=u.userId||u.user_id||u.id;
+          if(!uid) return null;
           return JSON.stringify({name:u.nickname||u.nickName||u.name||"",
-            uid:u.userId||u.user_id||u.id,redID:u.redId||u.red_id,
+            uid:String(uid),redID:u.redId||u.red_id,
             avatar:u.imageb||u.images||u.image||u.avatar});
         })()
         """
         guard let result = try? await webView.evaluateJavaScript(script) as? String,
               let data = result.data(using: .utf8),
-              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let name = dict["name"] as? String, !name.isEmpty else { return }
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if dict["loggedOut"] as? Bool == true {
+            if account != nil {
+                account = nil
+                UserDefaults.standard.removeObject(forKey: "session.account")
+            }
+            return
+        }
+        guard let name = dict["name"] as? String, !name.isEmpty else { return }
         let avatar = (dict["avatar"] as? String).flatMap { URL(string: $0.hasPrefix("//") ? "https:" + $0 : $0) }
-        account = SignedInAccount(name: name, uid: dict["uid"] as? String, redID: dict["redID"] as? String,
-                                  avatar: avatar, verifiedAt: Date())
-        if let data = try? JSONEncoder().encode(account) { UserDefaults.standard.set(data, forKey: "session.account") }
-        if let avatar { _ = await AuthorAvatarStore.shared.imageData(for: avatar) }
+        let uid = dict["uid"] as? String
+        let redID = dict["redID"] as? String
+        let unchanged = account?.name == name && account?.uid == uid
+            && account?.redID == redID && account?.avatar == avatar
+        if !unchanged {
+            account = SignedInAccount(name: name, uid: uid, redID: redID, avatar: avatar, verifiedAt: Date())
+            if let encoded = try? JSONEncoder().encode(account) {
+                UserDefaults.standard.set(encoded, forKey: "session.account")
+            }
+        }
+        if let avatar {
+            Task { _ = await AuthorAvatarStore.shared.imageData(for: avatar) }
+        }
     }
     func logout() async {
         let cookies = await dataStore.httpCookieStore.allCookies()
         for cookie in cookies where Self.trusted(cookie.domain) {
             await dataStore.httpCookieStore.deleteCookie(cookie)
+        }
+        for cookie in HTTPCookieStorage.shared.cookies ?? [] where Self.trusted(cookie.domain) {
             HTTPCookieStorage.shared.deleteCookie(cookie)
         }
         let records = await dataStore.dataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes())

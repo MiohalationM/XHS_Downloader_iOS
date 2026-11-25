@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import JavaScriptCore
 
 struct RemoteMedia: Identifiable, Hashable, Codable, Sendable {
     enum MediaType: String, Codable, Sendable { case image, video, livePhoto }
@@ -79,6 +78,7 @@ final class XHSDownloader {
 
     private let session: URLSession
     private let mediaSession: URLSession
+    private let ownsSessions: Bool
     /// Background transfers only apply to the app's own session. An injected
     /// session (tests, previews) must never be bypassed by the shared background
     /// queue, which would ignore it entirely.
@@ -95,37 +95,24 @@ final class XHSDownloader {
     // losing both the note ID and its access token before parsing even begins.
     private let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
-    private let xhsLinkRegex = try! NSRegularExpression(pattern: "(?:https?://)?www\\.xiaohongshu\\.com/explore/\\S+", options: .caseInsensitive)
-    private let xhsUserRegex = try! NSRegularExpression(pattern: "(?:https?://)?www\\.xiaohongshu\\.com/user/profile/[a-z0-9]+/\\S+", options: .caseInsensitive)
-    private let xhsShareRegex = try! NSRegularExpression(pattern: "(?:https?://)?www\\.xiaohongshu\\.com/discovery/item/\\S+", options: .caseInsensitive)
-    private let xhsShortRegex = try! NSRegularExpression(pattern: "(?:https?://)?xhslink\\.(?:com|cn)/[^\\s\\\"<>\\\\^`{|}，。；！？、【】《》]+", options: .caseInsensitive)
-    private let idRegex = try! NSRegularExpression(pattern: "(?:explore|item)/([a-zA-Z0-9_\\-]+)/?(?:\\?|$)", options: .caseInsensitive)
-    private let idUserRegex = try! NSRegularExpression(pattern: "user/profile/[a-z0-9]+/([a-zA-Z0-9_\\-]+)/?(?:\\?|$)", options: .caseInsensitive)
-    private let htmlImgRegex = try! NSRegularExpression(pattern: "<img[^>]+src\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"][^>]*>", options: .caseInsensitive)
-    private let htmlUrlRegex = try! NSRegularExpression(pattern: "https?://[\\w\\-._~:/?#\\[\\]@!$&'()*+,;=%]+\\.(?:jpg|jpeg|png|gif|mp4|avi|mov|webm|wmv|flv|f4v|swf|mpg|mpeg|asf|3gp|3g2|mkv|webp|heic|heif)", options: .caseInsensitive)
+    private static let idRegex = try! NSRegularExpression(pattern: "(?:explore|item)/([a-zA-Z0-9_\\-]+)/?(?:\\?|#|$)", options: .caseInsensitive)
+    private static let idUserRegex = try! NSRegularExpression(pattern: "user/profile/[a-z0-9]+/([a-zA-Z0-9_\\-]+)/?(?:\\?|#|$)", options: .caseInsensitive)
+    private static let htmlImgRegex = try! NSRegularExpression(pattern: "<img[^>]+src\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"][^>]*>", options: .caseInsensitive)
+    private static let htmlUrlRegex = try! NSRegularExpression(pattern: "https?://[\\w\\-._~:/?#\\[\\]@!$&'()*+,;=%]+\\.(?:jpg|jpeg|png|gif|mp4|avi|mov|webm|wmv|flv|f4v|swf|mpg|mpeg|asf|3gp|3g2|mkv|webp|heic|heif)", options: .caseInsensitive)
 
-    private static let publishFormatter: DateFormatter = {
+    private static func makeFormatter(_ format: String) -> DateFormatter {
         let formatter = DateFormatter()
-        formatter.dateFormat = "yy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = format
         return formatter
-    }()
-
-    private static let isoDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter
-    }()
-
-    private static let compactDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd"
-        return formatter
-    }()
+    }
 
     init(session: URLSession? = nil, policy: DownloadPolicy = .load(), pacer: RequestPacer = RequestPacer()) {
         self.policy = policy
         self.pacer = pacer
         self.allowsBackgroundTransfers = session == nil
+        self.ownsSessions = session == nil
         if let session {
             self.session = session
             self.mediaSession = session
@@ -134,6 +121,13 @@ final class XHSDownloader {
             self.session = URLSession(configuration: configuration)
             self.mediaSession = URLSession(configuration:
                 (try? NetworkPolicy.configuration(policy, media: true)) ?? URLSessionConfiguration.default)
+        }
+    }
+
+    deinit {
+        if ownsSessions {
+            session.finishTasksAndInvalidate()
+            mediaSession.finishTasksAndInvalidate()
         }
     }
 
@@ -169,8 +163,9 @@ final class XHSDownloader {
                 // Background transfers cannot carry a proxy configuration, so a
                 // proxied media request is deliberately sent through the regular
                 // session rather than silently bypassing the user's proxy.
+                let proxyConfigured = !policy.proxy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 let useBackground = allowsBackgroundTransfers && transferIdentity != nil
-                    && BackgroundTransfers.shared.supportsProxy(policy.proxyMedia && !policy.proxy.isEmpty)
+                    && BackgroundTransfers.shared.supportsProxy(policy.proxyMedia && proxyConfigured)
                 if useBackground, let transferIdentity {
                     (temporary, response) = try await BackgroundTransfers.shared.download(request, identity: transferIdentity, progress: progress)
                 } else { (temporary, response) = try await mediaSession.download(for: request) }
@@ -182,13 +177,25 @@ final class XHSDownloader {
                 }
                 try Task.checkCancellation()
                 let ext = try await MediaFileValidator.validate(temporary, response: response, isVideo: media.isVideo)
-                let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                var directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                     .appendingPathComponent("Transfers", isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                try? directory.setResourceValues(values)
                 let destination = directory.appendingPathComponent("\(UUID().uuidString)_\(media.fileBaseName).\(ext)")
-                try FileManager.default.moveItem(at: temporary, to: destination)
+                do {
+                    try FileManager.default.moveItem(at: temporary, to: destination)
+                } catch {
+                    // Local filesystem failures (e.g. ENAMETOOLONG / out of space)
+                    // cannot be fixed by re-downloading every CDN candidate.
+                    throw error
+                }
                 return destination
             } catch is CancellationError { throw CancellationError() }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain || error.domain == NSPOSIXErrorDomain {
+                throw error
+            }
             catch {
                 if Task.isCancelled { throw CancellationError() }
                 lastError = error
@@ -218,19 +225,79 @@ extension XHSDownloader {
         return (text as NSString).substring(with: result.range)
     }
 
+    private final class SafeRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        let stopAtTrustedNote: Bool
+        private let lock = NSLock()
+        private var captured: URL?
+        var capturedURL: URL? { lock.withLock { captured } }
+
+        init(stopAtTrustedNote: Bool = false) {
+            self.stopAtTrustedNote = stopAtTrustedNote
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            var next = request
+            if let url = next.url, let host = url.host?.lowercased() {
+                if stopAtTrustedNote, WebSession.trusted(host) {
+                    var upgraded = url
+                    if upgraded.scheme?.lowercased() == "http",
+                       var comps = URLComponents(url: upgraded, resolvingAgainstBaseURL: false) {
+                        comps.scheme = "https"
+                        upgraded = comps.url ?? upgraded
+                    }
+                    if XHSURLDetector.noteID(from: upgraded) != nil {
+                        lock.withLock { captured = upgraded }
+                        completionHandler(nil)
+                        return
+                    }
+                }
+                // Strip manually injected Cookie header whenever redirecting
+                // away from trusted XHS domains or downgrading to plaintext HTTP.
+                if next.url?.scheme?.lowercased() != "https" || !WebSession.trusted(host) {
+                    next.setValue(nil, forHTTPHeaderField: "Cookie")
+                }
+            } else {
+                next.setValue(nil, forHTTPHeaderField: "Cookie")
+            }
+            completionHandler(next)
+        }
+    }
+
+    private static func upgradeToHTTPS(_ url: URL) -> URL {
+        guard url.scheme?.lowercased() == "http",
+              let host = url.host?.lowercased(),
+              WebSession.trusted(host) || host == "xhslink.com" || host.hasSuffix(".xhslink.com")
+                || host == "xhslink.cn" || host.hasSuffix(".xhslink.cn"),
+              var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url
+        }
+        comps.scheme = "https"
+        return comps.url ?? url
+    }
+
+    private static func isShortLinkHost(_ host: String?) -> Bool {
+        guard let lower = host?.lowercased() else { return false }
+        return lower == "xhslink.com" || lower.hasSuffix(".xhslink.com")
+            || lower == "xhslink.cn" || lower.hasSuffix(".xhslink.cn")
+    }
+
     func prepareContext(for raw: String, logger: LogHandler) async throws -> LinkContext? {
         var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return nil }
         if !cleaned.lowercased().hasPrefix("http") {
             cleaned = "https://" + cleaned
         }
-        guard let originalURL = URL(string: cleaned) else { return nil }
+        guard let parsedURL = URL(string: cleaned) else { return nil }
+        let originalURL = Self.upgradeToHTTPS(parsedURL)
 
         var resolvedURL = originalURL
-        if cleaned.contains("xhslink.com") || cleaned.contains("xhslink.cn") {
-            if let redirect = await resolveShortLink(originalURL) {
-                resolvedURL = redirect
-                await logger("短链接已解析为：\(redirect.absoluteString)")
+        if Self.isShortLinkHost(originalURL.host) {
+            if let redirect = try await resolveShortLink(originalURL) {
+                resolvedURL = Self.upgradeToHTTPS(redirect)
+                await logger("短链接已解析为：\(resolvedURL.absoluteString)")
             } else {
                 await logger("短链接解析失败，尝试直接使用原链接")
             }
@@ -242,66 +309,79 @@ extension XHSDownloader {
             components?.host = "www." + host
             resolvedURL = components?.url ?? resolvedURL
         }
+        guard resolvedURL.scheme?.lowercased() == "https",
+              let host = resolvedURL.host?.lowercased(),
+              WebSession.trusted(host) || Self.isShortLinkHost(host) else {
+            return nil
+        }
         let postId = extractPostId(from: resolvedURL.absoluteString)
         return LinkContext(sourceURL: originalURL, resolvedURL: resolvedURL, postId: postId)
     }
 
-    func resolveShortLink(_ url: URL) async -> URL? {
-        var request = URLRequest(url: url)
+    func resolveShortLink(_ url: URL) async throws -> URL? {
+        _ = try NetworkPolicy.proxy(policy.proxy)
+        var request = URLRequest(url: Self.upgradeToHTTPS(url))
         request.httpMethod = "GET"
         request.setValue(userAgent + " xiaohongshu", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 15
+        request.timeoutInterval = min(180, max(5, policy.timeout))
         applySessionCookies(to: &request)
+        try await pacer.wait(interval: policy.requestInterval)
+        let delegate = SafeRedirectDelegate(stopAtTrustedNote: true)
         do {
-            _ = try NetworkPolicy.proxy(policy.proxy)
-            try await pacer.wait(interval: policy.requestInterval)
-            let (_, response) = try await session.data(for: request)
-            return response.url
+            let (_, response) = try await session.data(for: request, delegate: delegate)
+            return delegate.capturedURL ?? response.url
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as ProxyConfigurationError {
+            throw error
         } catch {
+            if Task.isCancelled { throw CancellationError() }
+            if let captured = delegate.capturedURL { return captured }
             return nil
         }
     }
 
     private func applySessionCookies(to request: inout URLRequest) {
-        request.httpShouldHandleCookies = policy.useWebSession
-        guard policy.useWebSession, let url = request.url else { return }
-        if let host = url.host, WebSession.trusted(host) {
-            let base = host.contains("rednote") ? "www.rednote.com" : "www.xiaohongshu.com"
-            let manual = SessionVault.cookie(base)
-            if !manual.isEmpty {
-                request.setValue(manual, forHTTPHeaderField: "Cookie")
-                return
-            }
-        }
-        // The cookie store selects by domain, path and secure flag. In
-        // particular, never transplant a RedNote cookie onto a short-link host.
-        if let cookies = session.configuration.httpCookieStorage?.cookies(for: url), !cookies.isEmpty {
-            for (field, value) in HTTPCookie.requestHeaderFields(with: cookies) {
-                request.setValue(value, forHTTPHeaderField: field)
-            }
+        request.httpShouldHandleCookies = false
+        guard policy.useWebSession,
+              let url = request.url,
+              url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              WebSession.trusted(host) else { return }
+        let base = host.contains("rednote") ? "www.rednote.com" : "www.xiaohongshu.com"
+        let manual = SessionVault.cookie(base)
+        let web = HTTPCookie.requestHeaderFields(with: HTTPCookieStorage.shared.cookies(for: url) ?? [])["Cookie"] ?? ""
+        let combined = [web, manual].filter { !$0.isEmpty }.joined(separator: "; ")
+        if !combined.isEmpty {
+            request.setValue(combined, forHTTPHeaderField: "Cookie")
         }
     }
 
     func fetchPostDetails(for url: URL) async throws -> String? {
         _ = try NetworkPolicy.proxy(policy.proxy)
-        var request = URLRequest(url: url)
+        let safeURL = Self.upgradeToHTTPS(url)
+        var request = URLRequest(url: safeURL)
         request.httpMethod = "GET"
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("text/html,application/xhtml+xml,application/xml;q=1.0,image/avif,image/webp,image/apng,*/*;q=1.0", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = policy.timeout
+        request.timeoutInterval = min(180, max(5, policy.timeout))
         applySessionCookies(to: &request)
         try await pacer.wait(interval: policy.requestInterval)
+        let maxRetries = max(0, min(10, policy.retries))
+        let delegate = SafeRedirectDelegate()
         var result: (Data, URLResponse)?
-        for attempt in 0...max(0, min(10, policy.retries)) {
+        for attempt in 0...maxRetries {
             do {
-                let value = try await session.data(for: request)
-                if let http = value.1 as? HTTPURLResponse, [429, 500, 502, 503, 504].contains(http.statusCode), attempt < policy.retries {
+                let value = try await session.data(for: request, delegate: delegate)
+                if let http = value.1 as? HTTPURLResponse,
+                   [429, 500, 502, 503, 504].contains(http.statusCode),
+                   attempt < maxRetries {
                     let delay = min(120, max(1, Double(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? Double(attempt + 1) * 2))
                     try await Task.sleep(for: .seconds(delay)); continue
                 }
                 result = value; break
             } catch {
-                if Task.isCancelled || attempt >= policy.retries { throw error }
+                if Task.isCancelled || attempt >= maxRetries { throw error }
                 try await Task.sleep(for: .seconds(Double(attempt + 1)))
             }
         }
@@ -314,10 +394,7 @@ extension XHSDownloader {
         if let html = String(data: data, encoding: .utf8) {
             return html
         }
-        if let html = String(data: data, encoding: .ascii) {
-            return html
-        }
-        return nil
+        return String(decoding: data, as: UTF8.self)
     }
 
     func parsePostDetails(html: String) -> [MediaDescriptor] {
@@ -367,36 +444,140 @@ extension XHSDownloader {
               let endRange = html[startRange.lowerBound...].range(of: "</script>") else {
             return nil
         }
-
-        let scriptContent = String(html[startRange.lowerBound..<endRange.lowerBound])
-        guard let equalIndex = scriptContent.firstIndex(of: "=") else {
-            return nil
-        }
-
-        let expression = scriptContent[scriptContent.index(after: equalIndex)...]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return "var window = window || {}; window.__INITIAL_STATE__=\(expression);"
+        let afterEquals = html[startRange.upperBound..<endRange.lowerBound]
+        return Self.extractBalancedJSONObject(from: afterEquals)
     }
 
+    /// Parses the extracted `window.__INITIAL_STATE__` object literal without
+    /// executing untrusted JavaScript in `JSContext`. Bare JS literals such as
+    /// `undefined` / `NaN` / `Infinity` outside string literals are normalized
+    /// to JSON `null` in linear time.
     func evaluateInitialStateScript(_ script: String) -> [String: Any]? {
-        guard let context = JSContext() else { return nil }
-        context.exceptionHandler = { _, exception in
-            if let message = exception?.toString() {
-                NSLog("JSContext exception: \(message)")
-            }
+        let candidate: String
+        if let object = Self.extractBalancedJSONObject(from: script[...]) {
+            candidate = object
+        } else {
+            candidate = script
         }
-
-        context.evaluateScript("var window = {}; var document = {}; var navigator = {};")
-        context.evaluateScript(script)
-
-        guard let windowObject = context.objectForKeyedSubscript("window"),
-              let state = windowObject.objectForKeyedSubscript("__INITIAL_STATE__"),
-              let dictionary = state.toDictionary() as? [String: Any] else {
+        let sanitized = Self.sanitizeJSObjectLiteralToJSON(candidate)
+        guard let data = sanitized.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
+        return object
+    }
 
-        return dictionary
+    private static func extractBalancedJSONObject(from slice: Substring) -> String? {
+        let utf8 = Array(slice.utf8)
+        guard let start = utf8.firstIndex(of: UInt8(ascii: "{")) else { return nil }
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var index = start
+        while index < utf8.count {
+            let byte = utf8[index]
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if byte == UInt8(ascii: "\\") {
+                    escaped = true
+                } else if byte == UInt8(ascii: "\"") {
+                    inString = false
+                }
+            } else {
+                if byte == UInt8(ascii: "\"") {
+                    inString = true
+                } else if byte == UInt8(ascii: "{") {
+                    depth += 1
+                } else if byte == UInt8(ascii: "}") {
+                    depth -= 1
+                    if depth == 0 {
+                        return String(decoding: utf8[start...index], as: UTF8.self)
+                    }
+                }
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private static func sanitizeJSObjectLiteralToJSON(_ input: String) -> String {
+        let bytes = Array(input.utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(bytes.count)
+        let nullBytes: [UInt8] = Array("null".utf8)
+        let tokens: [[UInt8]] = [
+            Array("undefined".utf8),
+            Array("-Infinity".utf8),
+            Array("Infinity".utf8),
+            Array("NaN".utf8)
+        ]
+        func isIdentChar(_ byte: UInt8) -> Bool {
+            (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+                || (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
+                || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || byte == UInt8(ascii: "_") || byte == UInt8(ascii: "$")
+        }
+        var inString = false
+        var escaped = false
+        var i = 0
+        while i < bytes.count {
+            let b = bytes[i]
+            if inString {
+                out.append(b)
+                if escaped {
+                    escaped = false
+                } else if b == UInt8(ascii: "\\") {
+                    escaped = true
+                } else if b == UInt8(ascii: "\"") {
+                    inString = false
+                }
+                i += 1
+                continue
+            }
+            if b == UInt8(ascii: "\"") {
+                inString = true
+                out.append(b)
+                i += 1
+                continue
+            }
+            // Strip trailing comma before '}' or ']'.
+            if b == UInt8(ascii: ",") {
+                var lookahead = i + 1
+                while lookahead < bytes.count,
+                      bytes[lookahead] == UInt8(ascii: " ") || bytes[lookahead] == UInt8(ascii: "\t")
+                        || bytes[lookahead] == UInt8(ascii: "\n") || bytes[lookahead] == UInt8(ascii: "\r") {
+                    lookahead += 1
+                }
+                if lookahead < bytes.count,
+                   bytes[lookahead] == UInt8(ascii: "}") || bytes[lookahead] == UInt8(ascii: "]") {
+                    i += 1
+                    continue
+                }
+            }
+            let prevIsIdent = i > 0 && isIdentChar(bytes[i - 1])
+            var matched = false
+            if !prevIsIdent {
+                for token in tokens {
+                    if i + token.count <= bytes.count,
+                       bytes[i..<(i + token.count)].elementsEqual(token) {
+                        let nextIndex = i + token.count
+                        let nextIsIdent = nextIndex < bytes.count && isIdentChar(bytes[nextIndex])
+                        if !nextIsIdent {
+                            out.append(contentsOf: nullBytes)
+                            i = nextIndex
+                            matched = true
+                            break
+                        }
+                    }
+                }
+            }
+            if !matched {
+                out.append(b)
+                i += 1
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 
     func parseNoteRoot(_ noteRoot: [String: Any]) -> [MediaDescriptor] {
@@ -552,22 +733,27 @@ extension XHSDownloader {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        if let match = trimmed.range(of: #"\d{2}-\d{2}-\d{2}"#, options: .regularExpression) {
+        // Reject pure 10/13-digit epoch strings here so they fall through to
+        // epoch parsing instead of misinterpreting e.g. "1712051200" as 1712-05-12.
+        if trimmed.allSatisfy(\.isNumber), (10...13).contains(trimmed.count) {
+            return nil
+        }
+
+        if let match = trimmed.range(of: #"\b\d{4}-\d{2}-\d{2}\b"#, options: .regularExpression) {
+            let substring = String(trimmed[match])
+            if let date = Self.makeFormatter("yyyy-MM-dd").date(from: substring) {
+                return Self.makeFormatter("yy-MM-dd").string(from: date)
+            }
+        }
+
+        if let match = trimmed.range(of: #"\b\d{2}-\d{2}-\d{2}\b"#, options: .regularExpression) {
             return String(trimmed[match])
         }
 
-        if let match = trimmed.range(of: #"\d{4}-\d{2}-\d{2}"#, options: .regularExpression) {
-            let substring = String(trimmed[match])
-            if let date = Self.isoDateFormatter.date(from: substring) {
-                return Self.publishFormatter.string(from: date)
-            }
-        }
-
-        if let digits = digitsOnly(from: trimmed), digits.count >= 8 {
-            let firstEight = String(digits.prefix(8))
-            if let date = Self.compactDateFormatter.date(from: firstEight) {
-                return Self.publishFormatter.string(from: date)
-            }
+        if let digits = digitsOnly(from: trimmed), digits.count == 8,
+           let year = Int(digits.prefix(4)), (1990...2100).contains(year),
+           let date = Self.makeFormatter("yyyyMMdd").date(from: digits) {
+            return Self.makeFormatter("yy-MM-dd").string(from: date)
         }
 
         return nil
@@ -584,7 +770,7 @@ extension XHSDownloader {
         if value < 1_000_000_000_000 { value *= 1000 }
         if value < 946_684_800_000 { return nil }
         let date = Date(timeIntervalSince1970: value / 1000)
-        return Self.publishFormatter.string(from: date)
+        return Self.makeFormatter("yy-MM-dd").string(from: date)
     }
 
     func extractStreamUrls(from stream: [String: Any]) -> [String] {
@@ -633,7 +819,7 @@ extension XHSDownloader {
         let nsHTML = html as NSString
         let fullRange = NSRange(location: 0, length: nsHTML.length)
 
-        htmlImgRegex.enumerateMatches(in: html, options: [], range: fullRange) { result, _, _ in
+        Self.htmlImgRegex.enumerateMatches(in: html, options: [], range: fullRange) { result, _, _ in
             guard let range = result?.range(at: 1) else { return }
             let url = nsHTML.substring(with: range)
             if isValidMediaUrl(url) {
@@ -641,7 +827,7 @@ extension XHSDownloader {
             }
         }
 
-        htmlUrlRegex.enumerateMatches(in: html, options: [], range: fullRange) { result, _, _ in
+        Self.htmlUrlRegex.enumerateMatches(in: html, options: [], range: fullRange) { result, _, _ in
             guard let range = result?.range else { return }
             let url = nsHTML.substring(with: range)
             if isValidMediaUrl(url) {
@@ -689,10 +875,10 @@ extension XHSDownloader {
     }
 
     func extractPostId(from url: String) -> String? {
-        if let match = idRegex.firstMatch(in: url, options: [], range: NSRange(location: 0, length: (url as NSString).length)) {
+        if let match = Self.idRegex.firstMatch(in: url, options: [], range: NSRange(location: 0, length: (url as NSString).length)) {
             return (url as NSString).substring(with: match.range(at: 1))
         }
-        if let match = idUserRegex.firstMatch(in: url, options: [], range: NSRange(location: 0, length: (url as NSString).length)) {
+        if let match = Self.idUserRegex.firstMatch(in: url, options: [], range: NSRange(location: 0, length: (url as NSString).length)) {
             return (url as NSString).substring(with: match.range(at: 1))
         }
 

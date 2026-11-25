@@ -990,10 +990,13 @@ struct DestinationWiringTests {
         #expect(resolved?.isVideo == false)
     }
 
-    @Test func filesOnlyRecordNeedsAnExistingFile() async {
-        var record = MediaAssetRecord(localIdentifier: "file:/definitely/missing.heic", fileName: "x.heic", isVideo: false)
-        record.filesPaths = ["/definitely/missing.heic"]
-        #expect(LibraryMedia(record: record, lookup: [:]) == nil)
+    @Test func filesOnlyRecordWithoutArchivePathsReturnsNil() async {
+        let empty = MediaAssetRecord(localIdentifier: "missing-photo", fileName: "x.heic", isVideo: false)
+        #expect(LibraryMedia(record: empty, lookup: [:]) == nil)
+        // An unavailable external archive record stays visible so the user can reauthorize it.
+        var archived = MediaAssetRecord(localIdentifier: "file:/definitely/missing.heic", fileName: "x.heic", isVideo: false)
+        archived.filesPaths = ["/definitely/missing.heic"]
+        #expect(LibraryMedia(record: archived, lookup: [:])?.id == "file:/definitely/missing.heic")
     }
 }
 
@@ -1069,6 +1072,17 @@ private final class FlowFixtureProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
+private struct FlowStubPhotoLibrary: PhotoLibraryServing {
+    func deleteAssets(localIdentifiers: [String]) async throws {}
+    func removeAssetsFromAppAlbum(localIdentifiers: [String]) async {}
+    func saveMedia(at fileURL: URL, isVideo: Bool, originalFilename: String?, creationDate: Date?) async throws -> String {
+        "stub-photo-\(UUID().uuidString)"
+    }
+    func saveLivePhoto(photoURL: URL, pairedVideoURL: URL, originalFilename: String?, creationDate: Date?) async throws -> String {
+        "stub-live-\(UUID().uuidString)"
+    }
+}
+
 private struct FlowHarness {
     let root: URL
     let settings: AppSettings
@@ -1078,7 +1092,8 @@ private struct FlowHarness {
 
     @MainActor
     init(policy: DownloadPolicy = DownloadPolicy(), selective: Bool = false,
-         tasks: [DownloadTaskRecord] = []) async throws {
+         tasks: [DownloadTaskRecord] = [],
+         photoLibrary: any PhotoLibraryServing = FlowStubPhotoLibrary()) async throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let defaults = try #require(UserDefaults(suiteName: UUID().uuidString))
@@ -1095,7 +1110,7 @@ private struct FlowHarness {
         coordinator = DownloadCoordinator(
             settings: settings, store: taskStore, noteStore: noteStore,
             downloader: XHSDownloader(session: URLSession(configuration: configuration)),
-            photoLibrary: PhotoLibraryService.shared)
+            photoLibrary: photoLibrary)
         await coordinator.waitUntilLoaded()
         FlowFixtureProtocol.reset()
     }

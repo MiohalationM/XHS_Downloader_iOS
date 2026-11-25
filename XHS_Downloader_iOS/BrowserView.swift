@@ -10,6 +10,7 @@ struct BrowserView: View {
     var onImport: (BrowserImport, ImportRequest.Behavior) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @StateObject private var model = BrowserModel()
     @ObservedObject private var session = WebSession.shared
 
@@ -17,11 +18,11 @@ struct BrowserView: View {
     @State private var showsZoom = false
     @State private var isImporting = false
     @State private var zoomBeforeEditing: Double?
+    @FocusState private var addressFocused: Bool
 
     var body: some View {
         NavigationStack {
             BrowserWebContainer(model: model)
-                .ignoresSafeArea(edges: .bottom)
                 .overlay(alignment: .top) {
                     if model.progress > 0, model.progress < 1 {
                         ProgressView(value: model.progress)
@@ -29,8 +30,8 @@ struct BrowserView: View {
                             .tint(.coral)
                     }
                 }
-                .safeAreaBar(edge: .top, spacing: 0) { addressBar }
-                .safeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
+                .xhsSafeAreaBar(edge: .top, spacing: 0) { addressBar }
+                .xhsSafeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
             .navigationTitle(session.account?.name ?? L10n.text("browser.title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
@@ -45,7 +46,7 @@ struct BrowserView: View {
             }
             .sheet(isPresented: $showsZoom) {
                 zoomSheet
-                    .presentationDetents([.height(220)])
+                    .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.medium, .large] : [.height(240), .medium])
             }
             .task {
                 model.startSessionObservation()
@@ -69,16 +70,24 @@ struct BrowserView: View {
 
     private var addressBar: some View {
         HStack(spacing: 8) {
-            Image(systemName: "lock.fill")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            if model.currentURL?.scheme?.lowercased() == "https" {
+                Image(systemName: "lock.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             TextField(L10n.text("web.address"), text: $model.address)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.URL)
                 .font(.callout)
+                .focused($addressFocused)
+                .onChange(of: addressFocused) { _, focused in model.setEditingAddress(focused) }
                 .submitLabel(.go)
-                .onSubmit { model.commitAddress(); AppFeedback.play(.confirmation) }
+                .onSubmit {
+                    addressFocused = false
+                    model.commitAddress()
+                    AppFeedback.play(.confirmation)
+                }
                 .accessibilityIdentifier("browser-address-field")
             if model.isLoading {
                 Button {
@@ -92,71 +101,76 @@ struct BrowserView: View {
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 40)
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .xhsGlass(interactive: true, in: Capsule())
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .background { browserBarBackdrop(edge: .top) }
     }
 
     private var bottomBar: some View {
         let canImport = model.currentNoteURL != nil && !isImporting
-        return GlassEffectContainer(spacing: 8) {
-            HStack(spacing: 8) {
+        return XHSGlassContainer(spacing: 6) {
+            HStack(spacing: 6) {
                 Button {
                     importCurrent(.direct)
                 } label: {
                     Label(L10n.text("browser.download_this"), systemImage: "arrow.down.circle.fill")
                         .lineLimit(1)
-                        .minimumScaleFactor(0.75)
+                        .minimumScaleFactor(0.72)
                         .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
+                        .opacity(canImport ? 1 : 0.45)
+                        .padding(.horizontal, 10)
                         .frame(maxWidth: .infinity, minHeight: 44)
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.tint(.coral).interactive(), in: Capsule())
+                .xhsGlass(tint: .coral, prominent: true, interactive: canImport, in: Capsule())
                 .disabled(!canImport)
-                .opacity(canImport ? 1 : 0.45)
+                .layoutPriority(1)
 
                 Button {
                     importCurrent(.select)
                 } label: {
                     Label(L10n.text("browser.choose"), systemImage: "checklist")
                         .lineLimit(1)
-                        .minimumScaleFactor(0.75)
-                        .padding(.horizontal, 10)
+                        .minimumScaleFactor(0.72)
+                        .foregroundStyle(.primary)
+                        .opacity(canImport ? 1 : 0.45)
+                        .padding(.horizontal, 9)
                         .frame(minHeight: 44)
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .xhsGlass(interactive: canImport, in: Capsule())
                 .disabled(!canImport)
-                .opacity(canImport ? 1 : 0.45)
 
                 Button {
                     importCurrent(.informationOnly)
                 } label: {
                     Label(L10n.text("browser.save_caption"), systemImage: "text.alignleft")
                         .lineLimit(1)
-                        .minimumScaleFactor(0.75)
-                        .padding(.horizontal, 10)
+                        .minimumScaleFactor(0.72)
+                        .foregroundStyle(.primary)
+                        .opacity(canImport ? 1 : 0.45)
+                        .padding(.horizontal, 9)
                         .frame(minHeight: 44)
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .xhsGlass(interactive: canImport, in: Capsule())
                 .disabled(!canImport)
-                .opacity(canImport ? 1 : 0.45)
 
                 Button {
                     model.refreshLinks()
                     showsLinks = true
                 } label: {
                     Image(systemName: "list.bullet.rectangle")
+                        .foregroundStyle(.primary)
                         .frame(width: 44, height: 44)
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Circle())
+                .xhsGlass(interactive: true, in: Circle())
                 .accessibilityLabel(L10n.text("browser.links"))
                 .accessibilityIdentifier("browser-links-button")
             }
@@ -164,6 +178,21 @@ struct BrowserView: View {
         .font(.footnote.weight(.semibold))
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .background { browserBarBackdrop(edge: .bottom) }
+    }
+
+    @ViewBuilder
+    private func browserBarBackdrop(edge: VerticalEdge) -> some View {
+        if #available(iOS 26.0, *) {
+            Color.clear
+        } else {
+            Rectangle()
+                .fill(.bar)
+                .overlay(alignment: edge == .top ? .bottom : .top) {
+                    Divider()
+                }
+                .ignoresSafeArea(edges: edge == .top ? .top : .bottom)
+        }
     }
 
     @ToolbarContentBuilder
@@ -171,10 +200,7 @@ struct BrowserView: View {
         ToolbarItem(placement: .topBarLeading) {
             Button(L10n.text("common.close")) {
                 AppFeedback.play(.navigation)
-                Task {
-                    await model.refreshSession()
-                    dismiss()
-                }
+                dismiss()
             }
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
@@ -229,45 +255,50 @@ struct BrowserView: View {
     }
 
     private var zoomSheet: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(L10n.text("browser.zoom")).font(.headline)
-            HStack {
-                Text("\(Int(model.zoom * 100))%")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Slider(value: $model.zoom, in: 0.5...2.0, step: 0.1) { editing in
-                    if editing { zoomBeforeEditing = model.zoom }
-                    else {
-                        let changed = zoomBeforeEditing.map { $0 != model.zoom } ?? false
-                        zoomBeforeEditing = nil
-                        if changed { AppFeedback.play(.selection) }
-                    }
-                }
-            }
-            GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
-                    ForEach([0.75, 1.0, 1.25, 1.5], id: \.self) { value in
-                        let selected = abs(model.zoom - value) < 0.01
-                        Button {
-                            guard model.zoom != value else { return }
-                            model.zoom = value
-                            AppFeedback.play(.selection)
-                        } label: {
-                            Text("\(Int(value * 100))%")
-                                .font(.footnote.weight(.semibold).monospacedDigit())
-                                .foregroundStyle(selected ? .white : .primary)
-                                .padding(.horizontal, 14)
-                                .frame(minHeight: 36)
-                                .contentShape(Capsule())
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text(L10n.text("browser.zoom")).font(.headline)
+                HStack {
+                    Text("\(Int(model.zoom * 100))%")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Slider(value: $model.zoom, in: 0.5...2.0, step: 0.1) { editing in
+                        if editing { zoomBeforeEditing = model.zoom }
+                        else {
+                            let changed = zoomBeforeEditing.map { $0 != model.zoom } ?? false
+                            zoomBeforeEditing = nil
+                            if changed { AppFeedback.play(.selection) }
                         }
-                        .buttonStyle(.plain)
-                        .glassEffect(selected ? .regular.tint(.coral).interactive() : .regular.interactive(), in: Capsule())
                     }
                 }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    XHSGlassContainer(spacing: 8) {
+                        HStack(spacing: 8) {
+                            ForEach([0.75, 1.0, 1.25, 1.5], id: \.self) { value in
+                                let selected = abs(model.zoom - value) < 0.01
+                                Button {
+                                    guard model.zoom != value else { return }
+                                    model.zoom = value
+                                    AppFeedback.play(.selection)
+                                } label: {
+                                    Text("\(Int(value * 100))%")
+                                        .font(.footnote.weight(.semibold).monospacedDigit())
+                                        .foregroundStyle(selected ? .white : .primary)
+                                        .padding(.horizontal, 14)
+                                        .frame(minHeight: 36)
+                                        .contentShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .xhsGlass(tint: selected ? .coral : nil, prominent: selected, interactive: true, in: Capsule())
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .scrollClipDisabled()
             }
-            Spacer(minLength: 0)
+            .padding(20)
         }
-        .padding(20)
     }
 
     /// Prefers the note object already in the page; falls back to the URL only
@@ -380,7 +411,7 @@ struct BrowserLink: Identifiable, Hashable {
 }
 
 @MainActor
-final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKHTTPCookieStoreObserver {
+final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
     @Published var address = ""
     @Published var progress: Double = 0
     @Published var isLoading = false
@@ -403,6 +434,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKHT
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         view.navigationDelegate = self
+        view.uiDelegate = self
         view.allowsBackForwardNavigationGestures = true
         view.pageZoom = zoom
         view.isInspectable = false
@@ -411,6 +443,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKHT
 
     private var progressObservation: NSKeyValueObservation?
     private var urlObservation: NSKeyValueObservation?
+    private var backObservation: NSKeyValueObservation?
+    private var forwardObservation: NSKeyValueObservation?
 
     override init() {
         super.init()
@@ -431,12 +465,26 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKHT
                 if !owner.isEditingAddress { owner.address = url.absoluteString }
             }
         }
+        backObservation = webView.observe(\.canGoBack, options: [.new]) { [weak self] view, _ in
+            let value = view.canGoBack
+            guard let owner = self else { return }
+            Task { @MainActor in owner.canGoBack = value }
+        }
+        forwardObservation = webView.observe(\.canGoForward, options: [.new]) { [weak self] view, _ in
+            let value = view.canGoForward
+            guard let owner = self else { return }
+            Task { @MainActor in owner.canGoForward = value }
+        }
     }
 
     private var isEditingAddress = false
     private var observesSession = false
     private var cookieRefresh: Task<Void, Never>?
     private var sessionNeedsRefresh = false
+
+    func setEditingAddress(_ editing: Bool) {
+        isEditingAddress = editing
+    }
 
     func startSessionObservation() {
         guard !observesSession else { return }
@@ -582,7 +630,30 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKHT
         }
     }
 
+    // MARK: - WKUIDelegate
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url,
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            webView.load(navigationAction.request)
+        }
+        return nil
+    }
+
     // MARK: - WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if let scheme = navigationAction.request.url?.scheme?.lowercased(),
+           !["http", "https", "about", "blob", "data"].contains(scheme) {
+            // Silently ignore app deep-link schemes (e.g. xhsdiscover://) so
+            // they don't fail provisional navigation with an error alert.
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         isLoading = true

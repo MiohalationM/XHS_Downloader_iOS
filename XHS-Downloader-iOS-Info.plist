@@ -9,8 +9,10 @@
     </dict></array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 	</dict>
+	<key>XHSAppGroupIdentifier</key>
+	<string>group.com.neoruaa.xhsdn</string>
 </dict>
 </plist>

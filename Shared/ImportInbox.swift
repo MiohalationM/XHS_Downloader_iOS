@@ -30,28 +30,49 @@ struct ImportRequest: Codable, Identifiable, Sendable {
     }
 }
 
-/// One shared link grammar: the app and the share extension must agree on what
-/// counts as a note link, otherwise the extension reports a different count from
-/// the one the app will actually import.
+/// One shared link grammar and canonicalizer: the app and the share extension
+/// must agree on both link count and deduplication so they never disagree on
+/// case-sensitive short links or trailing punctuation.
 enum ImportText {
-    static let linkPattern = #"(?<![a-zA-Z0-9@.])(?:https?://)?(?:www\.)?(?:xiaohongshu\.com|rednote\.com|xhslink\.(?:com|cn))/[^\s<>\"',;，。；：！？、（）【】《》]+"#
+    static let linkPattern = #"(?<![a-zA-Z0-9@.])(?:https?://)?(?:www\.)?(?:xiaohongshu\.com|rednote\.com|xhslink\.(?:com|cn))/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+=%]+"#
 
-    static func linkCount(in input: String) -> Int {
-        guard let expression = try? NSRegularExpression(pattern: linkPattern, options: [.caseInsensitive]) else { return 0 }
+    private static let expression = try! NSRegularExpression(
+        pattern: linkPattern,
+        options: [.caseInsensitive]
+    )
+
+    static func extractLinks(from input: String) -> [String] {
         let range = NSRange(input.startIndex..<input.endIndex, in: input)
         var seen = Set<String>()
-        for match in expression.matches(in: input, range: range) {
-            guard let swiftRange = Range(match.range, in: input) else { continue }
-            seen.insert(String(input[swiftRange]).lowercased())
+        return expression.matches(in: input, range: range).compactMap { match in
+            guard let swiftRange = Range(match.range, in: input) else { return nil }
+            var value = String(input[swiftRange])
+            while let last = value.last, ".,;:!?)]}".contains(last) { value.removeLast() }
+            if !value.lowercased().hasPrefix("http") { value = "https://" + value }
+            guard let url = URL(string: value), let host = url.host?.lowercased() else { return nil }
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.host = host
+            value = components?.url?.absoluteString ?? value
+            guard seen.insert(value).inserted else { return nil }
+            return value
         }
-        return seen.count
+    }
+
+    static func linkCount(in input: String) -> Int {
+        extractLinks(from: input).count
     }
 }
 
 /// Both processes use immutable, individual files. Acknowledgement happens only
 /// after the main app has persisted the corresponding tasks.
 struct ImportInbox {
-    static let groupIdentifier = "group.com.neoruaa.xhsdn"
+    static let groupIdentifier: String = {
+        if let configured = Bundle.main.object(forInfoDictionaryKey: "XHSAppGroupIdentifier") as? String {
+            let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !trimmed.hasPrefix("$(") { return trimmed }
+        }
+        return "group.com.neoruaa.xhsdn"
+    }()
     let directory: URL
 
     static func shared() throws -> ImportInbox {
@@ -70,10 +91,26 @@ struct ImportInbox {
 
     func pending() throws -> [ImportRequest] {
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
-        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
-            .map { try JSONDecoder().decode(ImportRequest.self, from: Data(contentsOf: $0)) }
-            .sorted { ($0.createdAt, $0.id.uuidString) < ($1.createdAt, $1.id.uuidString) }
+        var requests: [ImportRequest] = []
+        let decoder = JSONDecoder()
+        for url in files {
+            let data: Data
+            do {
+                data = try Data(contentsOf: url)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
+            }
+            do {
+                requests.append(try decoder.decode(ImportRequest.self, from: data))
+            } catch is DecodingError {
+                // Quarantine/remove corrupt inbox entries so a single bad JSON
+                // file cannot permanently poison all subsequent share imports.
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        return requests.sorted { ($0.createdAt, $0.id.uuidString) < ($1.createdAt, $1.id.uuidString) }
     }
 
     func acknowledge(_ id: UUID) throws {
@@ -87,7 +124,14 @@ struct ImportInbox {
         struct LegacyItem: Decodable { let id: UUID; let text: String; let createdAt: Date }
         let defaults = UserDefaults(suiteName: Self.groupIdentifier)
         guard let data = defaults?.data(forKey: "shared_inbox_items") else { return }
-        for item in try JSONDecoder().decode([LegacyItem].self, from: data) {
+        let items: [LegacyItem]
+        do {
+            items = try JSONDecoder().decode([LegacyItem].self, from: data)
+        } catch is DecodingError {
+            defaults?.removeObject(forKey: "shared_inbox_items")
+            return
+        }
+        for item in items {
             try append(ImportRequest(id: item.id, text: item.text, source: .share, createdAt: item.createdAt))
         }
         defaults?.removeObject(forKey: "shared_inbox_items")

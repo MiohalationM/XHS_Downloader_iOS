@@ -147,7 +147,7 @@ enum NamingFormatter {
         case "redId":
             return sanitize(metadata.redId) ?? ""
         case "title":
-            return sanitize(metadata.title) ?? ""
+            return sanitize(metadata.title, maxUTF8Bytes: 96) ?? ""
         case "postId":
             return sanitize(fallbackPostId) ?? ""
         case "publishTime":
@@ -177,25 +177,31 @@ enum NamingFormatter {
         }
     }
 
-    private static func sanitize(_ value: String?, allowHyphen: Bool = false) -> String? {
+    private static func sanitize(_ value: String?, allowHyphen: Bool = false, maxUTF8Bytes: Int = 150) -> String? {
         guard var value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             return nil
         }
-        let invalidCharacters: CharacterSet = {
-            var set = CharacterSet(charactersIn: "\\/:*?\"<>|")
-            if allowHyphen {
-                set.remove(charactersIn: "-")
-            }
-            return set
-        }()
+        let invalidCharacters = CharacterSet(charactersIn: "\\/:*?\"<>|")
         value = value.components(separatedBy: invalidCharacters).joined(separator: "_")
         value = value.replacingOccurrences(of: "[\\p{Cntrl}]", with: "", options: .regularExpression)
         value = value.replacingOccurrences(of: "\\s+", with: "_", options: .regularExpression)
         value = value.replacingOccurrences(of: "_+", with: "_", options: .regularExpression)
-        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-        if value.count > 120 {
-            value = String(value.prefix(120))
-        }
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "_."))
+        value = truncateUTF8(value, maxBytes: maxUTF8Bytes)
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "_."))
         return value.isEmpty ? nil : value
+    }
+
+    static func truncateUTF8(_ value: String, maxBytes: Int) -> String {
+        guard value.utf8.count > maxBytes else { return value }
+        var result = ""
+        var bytes = 0
+        for character in value {
+            let count = character.utf8.count
+            if bytes + count > maxBytes { break }
+            result.append(character)
+            bytes += count
+        }
+        return result
     }
 }

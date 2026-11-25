@@ -10,6 +10,25 @@ private final class IdentifierBox: @unchecked Sendable {
     var value: String?
 }
 
+private final class BackgroundKeysTimeoutBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Set<String>, Never>?
+
+    func attach(_ continuation: CheckedContinuation<Set<String>, Never>) {
+        lock.lock()
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resume(with value: Set<String>) {
+        lock.lock()
+        let cont = continuation
+        continuation = nil
+        lock.unlock()
+        cont?.resume(returning: value)
+    }
+}
+
 enum PhotoLibraryError: LocalizedError {
     case permissionDenied
     case saveFailed
@@ -26,6 +45,11 @@ protocol PhotoLibraryServing: Sendable {
     func saveMedia(at fileURL: URL, isVideo: Bool, originalFilename: String?, creationDate: Date?) async throws -> String
     func saveLivePhoto(photoURL: URL, pairedVideoURL: URL, originalFilename: String?, creationDate: Date?) async throws -> String
     func deleteAssets(localIdentifiers: [String]) async throws
+    func removeAssetsFromAppAlbum(localIdentifiers: [String]) async
+}
+
+extension PhotoLibraryServing {
+    func removeAssetsFromAppAlbum(localIdentifiers: [String]) async {}
 }
 
 actor PhotoLibraryService: PhotoLibraryServing {
@@ -80,7 +104,9 @@ actor PhotoLibraryService: PhotoLibraryServing {
         var temporaryPhotos: [URL] = []
         defer { for url in temporaryPhotos { try? FileManager.default.removeItem(at: url) } }
         for (type, url) in resources {
-            let prepared = type == .photo ? try PhotoImportMetadata.prepare(url) : url
+            // Optional telemetry cleanup must never block saving a valid photo
+            // (for example PNG/WebP/AVIF containers unsupported by CopyImageSource).
+            let prepared = type == .photo ? ((try? PhotoImportMetadata.prepare(url)) ?? url) : url
             if prepared != url { temporaryPhotos.append(prepared) }
             importResources.append((type, prepared))
         }
@@ -112,9 +138,28 @@ actor PhotoLibraryService: PhotoLibraryServing {
         guard await requestWriteAuthorization() else { throw PhotoLibraryError.permissionDenied }
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: localIdentifiers, options: nil)
         // Limited access may hide assets; don't silently erase their records.
-        guard assets.count == Set(localIdentifiers).count else { throw PhotoLibraryError.permissionDenied }
+        // Under full access, an asset already deleted in Apple Photos should not
+        // block deleting the remaining assets or the note.
+        if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited {
+            guard assets.count == Set(localIdentifiers).count else { throw PhotoLibraryError.permissionDenied }
+        }
         guard assets.count > 0 else { return }
         try await PHPhotoLibrary.shared().performChanges { PHAssetChangeRequest.deleteAssets(assets) }
+    }
+
+    func removeAssetsFromAppAlbum(localIdentifiers: [String]) async {
+        guard !localIdentifiers.isEmpty else { return }
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited,
+              let albumID = UserDefaults.standard.string(forKey: "photos.albumIdentifier"),
+              let album = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [albumID], options: nil).firstObject else {
+            return
+        }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: localIdentifiers, options: nil)
+        guard assets.count > 0 else { return }
+        try? await PHPhotoLibrary.shared().performChanges {
+            PHAssetCollectionChangeRequest(for: album)?.removeAssets(assets)
+        }
     }
 }
 
@@ -130,6 +175,7 @@ final class DownloadCoordinator: ObservableObject {
     @Published private(set) var likedNotes: Set<String>
     @Published private(set) var bookmarkedNotes: Set<String>
     @Published private(set) var authorRemarks: [String: String]
+    @Published private(set) var hiddenMediaIDs: Set<String>
     @Published var selectionState: SelectiveDownloadState?
     @Published var alertMessage: String?
     @Published private(set) var lastLogMessage: String = ""
@@ -163,8 +209,12 @@ final class DownloadCoordinator: ObservableObject {
     private var savedNoteRevision = 0
     private var admissions: Task<Bool, Never>?
     private var consumingInbox = false
+    private var needsInboxRescan = false
     private var pendingAdmissions = Set<UUID>()
+    private var deletingTaskIDs = Set<UUID>()
     private var jobs: [UUID: Task<Void, Never>] = [:]
+    private var componentProgress: [UUID: [String: (parentKey: String, received: Int64, expected: Int64, speed: Double)]] = [:]
+    private let activeBackgroundKeys: @Sendable () async -> Set<String>
     private var isWritingClipboard = false
     private var authorRefreshes = Set<UUID>()
     /// Note-keyed repairs are tracked separately from task-keyed ones.
@@ -179,7 +229,8 @@ final class DownloadCoordinator: ObservableObject {
         noteStore: NoteStore? = nil,
         downloader: XHSDownloader? = nil,
         photoLibrary: (any PhotoLibraryServing)? = nil,
-        initialTasks: [DownloadTaskRecord]? = nil
+        initialTasks: [DownloadTaskRecord]? = nil,
+        activeBackgroundKeys: (@Sendable () async -> Set<String>)? = nil
     ) {
         self.settings = settings
         self.store = store ?? DownloadTaskStore()
@@ -188,6 +239,7 @@ final class DownloadCoordinator: ObservableObject {
         self.downloader = downloader ?? XHSDownloader()
         self.injectedSession = downloader?.exposedSession
         self.photoLibrary = photoLibrary ?? PhotoLibraryService.shared
+        self.activeBackgroundKeys = activeBackgroundKeys ?? { await BackgroundTransfers.shared.activeTransferKeys() }
         self.tasks = []
         self.notes = []
         let library = Self.loadLibraryPreferences(defaults: settings.defaults)
@@ -195,6 +247,7 @@ final class DownloadCoordinator: ObservableObject {
         self.likedNotes = library.likes
         self.bookmarkedNotes = library.bookmarks
         self.authorRemarks = library.remarks
+        self.hiddenMediaIDs = Set(settings.defaults.stringArray(forKey: "library.hidden_media_ids") ?? [])
         startup = Task { [weak self] in
             guard let self else { return }
             if let initialTasks {
@@ -203,17 +256,28 @@ final class DownloadCoordinator: ObservableObject {
                     try await self.noteStore.save([])
                 } catch { self.alertMessage = error.localizedDescription }
             }
-            self.tasks = await self.store.load().sorted { $0.createdAt > $1.createdAt }
-            self.notes = await self.noteStore.load()
+            let loadedTasks = await self.store.load().sorted { $0.createdAt > $1.createdAt }
+            let loadedNotes = await self.noteStore.load()
             let taskError = await self.store.loadError
             let noteError = await self.noteStore.loadError
             self.loadError = taskError ?? noteError
-            self.migrateNotesFromTasksIfNeeded(loaded: self.notes)
+            self.tasks = loadedTasks
+            self.notes = loadedNotes
+            self.migrateNotesFromTasksIfNeeded(loaded: loadedNotes)
             self.migrateLibraryIdentifiers()
-            self.recoverInterruptedTasks()
             self.restoreArchiveGrants()
+            let hasDownloading = self.tasks.contains { $0.status == .downloading }
+            if hasDownloading {
+                await self.recoverInterruptedTasks()
+            } else {
+                self.pauseResidualNonDownloadingTasks()
+            }
             await self.flushPersistence()
             self.isLoaded = true
+            self.schedule()
+            if !hasDownloading {
+                Task { BackgroundTransfers.shared.cancelUnattachedTransfers() }
+            }
             if let error = self.loadError { self.alertMessage = L10n.format("library.load.failed", error) }
         }
     }
@@ -223,7 +287,7 @@ final class DownloadCoordinator: ObservableObject {
     func flushForBackground() {
         guard backgroundSaveToken == .invalid else { return }
         backgroundSaveToken = UIApplication.shared.beginBackgroundTask(withName: "Save download state") { [weak self] in
-            Task { @MainActor [weak self] in self?.endBackgroundSave() }
+            MainActor.assumeIsolated { self?.endBackgroundSave() }
         }
         let token = backgroundSaveToken
         Task {
@@ -384,6 +448,8 @@ final class DownloadCoordinator: ObservableObject {
                 combined.mediaAssets = Self.mergeAssets(existing.mediaAssets, note.mediaAssets)
                 combined.archiveGrants = ArchiveGrant.merging(existing.archiveGrants ?? [], fallback: note.archiveGrants ?? [])
                 combined.archiveTextPaths = Array(Set(existing.archiveTextPaths + note.archiveTextPaths)).sorted()
+                let mergedReusedCaptions = Array(Set((existing.reusedArchiveTextPaths ?? []) + (note.reusedArchiveTextPaths ?? []))).sorted()
+                combined.reusedArchiveTextPaths = mergedReusedCaptions.isEmpty ? nil : mergedReusedCaptions
                 combined.createdAt = min(existing.createdAt, note.createdAt)
                 combined.updatedAt = max(existing.updatedAt, note.updatedAt)
                 merged[note.id] = combined
@@ -437,6 +503,9 @@ final class DownloadCoordinator: ObservableObject {
                 if let paths = asset.filesPaths, !paths.isEmpty {
                     merged.filesPaths = Array(Set((merged.filesPaths ?? []) + paths)).sorted()
                 }
+                if let reused = asset.reusedFilesPaths, !reused.isEmpty {
+                    merged.reusedFilesPaths = Array(Set((merged.reusedFilesPaths ?? []) + reused)).sorted()
+                }
                 if let contentType = asset.contentType { merged.contentType = contentType }
                 if let isLive = asset.isLive { merged.isLive = isLive }
                 if let byteCount = asset.byteCount { merged.byteCount = byteCount }
@@ -463,7 +532,8 @@ final class DownloadCoordinator: ObservableObject {
                                   noteID: nil, canonicalURL: task.normalizedURL, title: title, body: body,
                                   metadata: NoteMetadata(), createdAt: task.createdAt,
                                   mediaAssets: task.mediaAssets, archiveTextPaths: task.archiveTextPaths ?? [],
-                                  informationOnly: task.informationOnly ?? false)
+                                  informationOnly: task.informationOnly ?? false,
+                                  reusedArchiveTextPaths: task.reusedArchiveTextPaths)
             return addingArchiveGrant(to: note, task: task)
         }
         let note = StoredNote(id: task.noteKey ?? StoredNote.key(noteID: resolved.noteID, url: task.normalizedURL),
@@ -475,7 +545,8 @@ final class DownloadCoordinator: ObservableObject {
                               createdAt: task.createdAt,
                               mediaAssets: task.mediaAssets,
                               archiveTextPaths: task.archiveTextPaths ?? [],
-                              informationOnly: task.informationOnly ?? false)
+                              informationOnly: task.informationOnly ?? false,
+                              reusedArchiveTextPaths: task.reusedArchiveTextPaths)
         return addingArchiveGrant(to: note, task: task)
     }
 
@@ -518,6 +589,8 @@ final class DownloadCoordinator: ObservableObject {
             updated.archiveGrants = ArchiveGrant.merging(updated.archiveGrants ?? [], fallback: note.archiveGrants ?? [])
             updated.mediaAssets = Self.mergeAssets(notes[index].mediaAssets, note.mediaAssets)
             updated.archiveTextPaths = Array(Set(notes[index].archiveTextPaths + note.archiveTextPaths)).sorted()
+            let mergedReusedCaptions = Array(Set((notes[index].reusedArchiveTextPaths ?? []) + (note.reusedArchiveTextPaths ?? []))).sorted()
+            updated.reusedArchiveTextPaths = mergedReusedCaptions.isEmpty ? nil : mergedReusedCaptions
             updated.updatedAt = Date()
             notes[index] = updated
         } else {
@@ -578,31 +651,215 @@ final class DownloadCoordinator: ObservableObject {
         catch { if !isPhotosCancellation(error) { alertMessage = error.localizedDescription } }
     }
 
+    /// Aggregates all photo IDs and normalized archive paths that must NOT be
+    /// physically deleted: references held by surviving notes/tasks, plus any
+    /// pre-existing files reused via `skipExisting` across all notes and tasks.
+    private func protectedReferences(
+        excludingNotes excludedNoteIDs: Set<String> = [],
+        excludingTasks excludedTaskIDs: Set<UUID> = [],
+        additionalReusedPaths: Set<String> = []
+    ) -> (photoIDs: Set<String>, paths: Set<String>) {
+        var protectedPhotoIDs = Set<String>()
+        var protectedPaths = Set<String>()
+        for note in notes {
+            let isExcluded = excludedNoteIDs.contains(note.id)
+            for asset in note.mediaAssets {
+                if !isExcluded {
+                    if !asset.localIdentifier.hasPrefix("file:"), !asset.localIdentifier.isEmpty {
+                        protectedPhotoIDs.insert(asset.localIdentifier)
+                    }
+                    for path in asset.archivePaths {
+                        protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+                    }
+                }
+                for path in asset.reusedFilesPaths ?? [] {
+                    protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+                }
+            }
+            if !isExcluded {
+                for path in note.archiveTextPaths {
+                    protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+                }
+            }
+            for path in note.reusedArchiveTextPaths ?? [] {
+                protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+            }
+        }
+        for task in tasks {
+            let isExcluded = excludedTaskIDs.contains(task.id)
+            for asset in task.mediaAssets {
+                if !isExcluded {
+                    if !asset.localIdentifier.hasPrefix("file:"), !asset.localIdentifier.isEmpty {
+                        protectedPhotoIDs.insert(asset.localIdentifier)
+                    }
+                    for path in asset.archivePaths {
+                        protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+                    }
+                }
+                for path in asset.reusedFilesPaths ?? [] {
+                    protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+                }
+            }
+            if !isExcluded {
+                for path in task.archiveTextPaths ?? [] {
+                    protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+                }
+            }
+            for path in task.reusedArchiveTextPaths ?? [] {
+                protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+            }
+        }
+        for path in additionalReusedPaths {
+            protectedPaths.insert(ArchiveGrant.normalizedPath(path))
+        }
+        return (protectedPhotoIDs, protectedPaths)
+    }
+
+    /// Unified single-media or batch-media deletion entry point for the viewer
+    /// and note reader. Protects originals referenced by other notes/tasks or
+    /// reused via `skipExisting`; when physical deletion is skipped for a
+    /// protected asset, still detaches the requested reference from `fromNoteID`.
+    func deleteMedia(_ identifiers: Set<String>, fromNoteID: String? = nil) async throws {
+        guard !identifiers.isEmpty else { return }
+        let excludedNotes: Set<String> = fromNoteID.map { [$0] } ?? []
+        let relatedTaskIDs: Set<UUID> = if let fromNoteID {
+            Set(tasks.filter { ($0.noteKey ?? storedNote(from: $0)?.id) == fromNoteID }.map(\.id))
+        } else {
+            []
+        }
+        let protected = protectedReferences(excludingNotes: excludedNotes, excludingTasks: relatedTaskIDs)
+
+        let requestedPhotoIDs = Set(identifiers.filter { !$0.hasPrefix("file:") && !$0.isEmpty })
+        let requestedPaths = Set(
+            identifiers
+                .filter { $0.hasPrefix("file:") }
+                .flatMap { ArchiveAccess.paths(in: $0) }
+                .map(ArchiveGrant.normalizedPath)
+        )
+        func matchesRequested(_ asset: MediaAssetRecord) -> Bool {
+            if identifiers.contains(asset.localIdentifier) || requestedPhotoIDs.contains(asset.localIdentifier) {
+                return true
+            }
+            if !requestedPaths.isEmpty {
+                let assetPaths = Set(asset.archivePaths.map(ArchiveGrant.normalizedPath))
+                if !assetPaths.isEmpty && !assetPaths.isDisjoint(with: requestedPaths) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        var deletableMedia = Set<String>()
+        func appendDeletable(_ identifier: String) {
+            guard !identifier.isEmpty else { return }
+            if identifier.hasPrefix("file:") {
+                let allowed = ArchiveAccess.paths(in: identifier)
+                    .filter { !protected.paths.contains(ArchiveGrant.normalizedPath($0)) }
+                if !allowed.isEmpty { deletableMedia.insert("file:" + allowed.joined(separator: "\n")) }
+            } else if !protected.photoIDs.contains(identifier) {
+                deletableMedia.insert(identifier)
+            }
+        }
+
+        for id in identifiers { appendDeletable(id) }
+        if let fromNoteID, let sourceNote = note(forKey: fromNoteID) {
+            for asset in sourceNote.mediaAssets where matchesRequested(asset) {
+                appendDeletable(asset.localIdentifier)
+                if !asset.localIdentifier.hasPrefix("file:"), let paths = asset.filesPaths, !paths.isEmpty {
+                    appendDeletable("file:" + paths.joined(separator: "\n"))
+                }
+            }
+        }
+
+        if !deletableMedia.isEmpty {
+            do {
+                try await MediaDeletionService.shared.delete(deletableMedia, photos: photoLibrary)
+                removeMediaReferences(deletableMedia)
+            } catch let failure as MediaDeletionFailure {
+                removeMediaReferences(failure.deleted)
+                await flushPersistence()
+                throw failure
+            }
+        }
+
+        if let fromNoteID {
+            var changed = false
+            if let index = notes.firstIndex(where: { $0.id == fromNoteID }) {
+                let before = notes[index].mediaAssets.count
+                notes[index].mediaAssets.removeAll(where: matchesRequested)
+                if notes[index].mediaAssets.count != before {
+                    notes[index].updatedAt = Date()
+                    changed = true
+                }
+            }
+            for index in tasks.indices where relatedTaskIDs.contains(tasks[index].id) {
+                let before = tasks[index].mediaAssets.count
+                tasks[index].mediaAssets.removeAll(where: matchesRequested)
+                if tasks[index].mediaAssets.count != before { changed = true }
+            }
+            if changed { persistNotes() }
+        }
+        await flushPersistence()
+    }
+
     func deleteNotes(_ ids: Set<String>, deleteMedia: Bool, additionalMedia: Set<String> = []) async throws {
         let selected = notes.filter { ids.contains($0.id) }
-        guard !selected.isEmpty || (deleteMedia && !additionalMedia.isEmpty) else { return }
+        guard !selected.isEmpty || !additionalMedia.isEmpty else { return }
         let related = Set(tasks.filter { task in
             ids.contains(task.noteKey ?? storedNote(from: task)?.id ?? "")
         }.map(\.id))
+        deletingTaskIDs.formUnion(related)
+        defer { deletingTaskIDs.subtract(related) }
         for id in related { stop(taskID: id, feedback: false) }
         for id in related { await jobs[id]?.value }
         let current = notes.filter { ids.contains($0.id) }
         if deleteMedia {
-            var media = Set(current.flatMap(\.mediaAssets).map(\.localIdentifier)).union(additionalMedia)
-            for note in current {
-                for asset in note.mediaAssets where asset.localIdentifier.hasPrefix("file:") == false {
-                    if let paths = asset.filesPaths, !paths.isEmpty { media.insert("file:" + paths.joined(separator: "\n")) }
+            let protected = protectedReferences(excludingNotes: ids, excludingTasks: related)
+            let protectedPhotoIDs = protected.photoIDs
+            let protectedPaths = protected.paths
+            var media = Set<String>()
+            func appendDeletable(_ identifier: String) {
+                guard !identifier.isEmpty else { return }
+                if identifier.hasPrefix("file:") {
+                    let allowed = ArchiveAccess.paths(in: identifier)
+                        .filter { !protectedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+                    if !allowed.isEmpty { media.insert("file:" + allowed.joined(separator: "\n")) }
+                } else if !protectedPhotoIDs.contains(identifier) {
+                    media.insert(identifier)
                 }
-                for path in note.archiveTextPaths { media.insert("file:" + path) }
             }
-            do {
-                try await MediaDeletionService.shared.delete(media, photos: photoLibrary)
-                removeMediaReferences(media)
+            for id in additionalMedia { appendDeletable(id) }
+            for note in current {
+                for asset in note.mediaAssets {
+                    appendDeletable(asset.localIdentifier)
+                    if !asset.localIdentifier.hasPrefix("file:"), let paths = asset.filesPaths, !paths.isEmpty {
+                        appendDeletable("file:" + paths.joined(separator: "\n"))
+                    }
+                }
+                for path in note.archiveTextPaths { appendDeletable("file:" + path) }
             }
-            catch let failure as MediaDeletionFailure {
-                removeMediaReferences(failure.deleted)
-                await flushPersistence()
-                throw failure
+            if !media.isEmpty {
+                do {
+                    try await MediaDeletionService.shared.delete(media, photos: photoLibrary)
+                    removeMediaReferences(media)
+                }
+                catch let failure as MediaDeletionFailure {
+                    removeMediaReferences(failure.deleted)
+                    await flushPersistence()
+                    throw failure
+                }
+            }
+        } else {
+            // Keep originals in Apple Photos, but remove them from the app's
+            // dedicated album and record them as hidden so deleted notes never
+            // immediately resurrect as standalone orphan cards in the feed.
+            let keptPhotoIDs = Set(
+                current.flatMap(\.mediaAssets).map(\.localIdentifier) + Array(additionalMedia)
+            ).filter { !$0.hasPrefix("file:") && !$0.isEmpty }
+            if !keptPhotoIDs.isEmpty {
+                await photoLibrary.removeAssetsFromAppAlbum(localIdentifiers: Array(keptPhotoIDs))
+                hiddenMediaIDs.formUnion(keptPhotoIDs)
+                settings.defaults.set(Array(hiddenMediaIDs), forKey: "library.hidden_media_ids")
             }
         }
         tasks.removeAll { related.contains($0.id) }
@@ -658,16 +915,17 @@ final class DownloadCoordinator: ObservableObject {
               let url = URL(string: note.canonicalURL),
               !noteAuthorRefreshes.contains(noteKey) else { return }
         noteAuthorRefreshes.insert(noteKey)
-        let active = downloader
+        let active = XHSDownloader(session: injectedSession, policy: settings.policy, pacer: pacer)
         let naming = XHSDownloader.NamingContext(
             preferences: NamingPreferences(enabled: false, template: NamingFormatter.defaultTemplate,
                                            timeZone: .current),
             downloadInstant: note.createdAt)
         do {
             let refreshed = try await active.resolveNote(from: url.absoluteString, naming: naming)
-            guard refreshed.metadata.userName?.isEmpty == false else { return }
+            guard note.noteID == nil || refreshed.noteID == note.noteID,
+                  refreshed.metadata.userName?.isEmpty == false else { return }
             updateNote(id: noteKey) { stored in
-                stored.metadata = refreshed.metadata
+                stored.metadata = Self.mergeMetadata(stored.metadata, refreshed.metadata)
                 stored.title = stored.title.isEmpty ? refreshed.title : stored.title
             }
             // Keep any task that produced this note in step so a later sync does
@@ -675,8 +933,9 @@ final class DownloadCoordinator: ObservableObject {
             for task in tasks where task.noteKey == noteKey {
                 update(task.id) { record in
                     if let current = record.resolvedNote {
+                        let merged = Self.mergeMetadata(current.metadata, refreshed.metadata)
                         record.resolvedNote = ResolvedNote(noteID: current.noteID, canonicalURL: current.canonicalURL,
-                            title: current.title, body: current.body, metadata: refreshed.metadata, media: current.media)
+                            title: current.title, body: current.body, metadata: merged, media: current.media)
                     }
                 }
             }
@@ -861,16 +1120,25 @@ final class DownloadCoordinator: ObservableObject {
     }
 
     func consume(inbox: ImportInbox) async {
-        guard !consumingInbox else { return }
+        if consumingInbox {
+            needsInboxRescan = true
+            return
+        }
         consumingInbox = true
         defer { consumingInbox = false }
-        do {
-            try inbox.migrateLegacyDefaults()
-            for request in try inbox.pending() {
-                guard await submit({ await self.accept(request) }).value else { break }
-                try inbox.acknowledge(request.id)
+        repeat {
+            needsInboxRescan = false
+            do {
+                try inbox.migrateLegacyDefaults()
+                for request in try inbox.pending() {
+                    guard await submit({ await self.accept(request) }).value else { break }
+                    try inbox.acknowledge(request.id)
+                }
+            } catch {
+                alertMessage = error.localizedDescription
+                break
             }
-        } catch { alertMessage = error.localizedDescription }
+        } while needsInboxRescan
     }
 
     func checkClipboard() {
@@ -880,24 +1148,25 @@ final class DownloadCoordinator: ObservableObject {
               // the paste banner while the user never asked for a download.
               UIApplication.shared.applicationState == .active else { return }
         let pasteboard = UIPasteboard.general
+        let defaults = UserDefaults.standard
         let key = "clipboard.lastHandledChange"
         let linksKey = "clipboard.lastHandledLinks"
         let change = pasteboard.changeCount
-        guard UserDefaults.standard.object(forKey: key) as? Int != change else { return }
+        guard defaults.object(forKey: key) as? Int != change else { return }
         // Record the attempt before reading so a denied paste doesn't repeatedly
         // request access for an unchanged clipboard.
-        UserDefaults.standard.set(change, forKey: key)
+        defaults.set(change, forKey: key)
         guard pasteboard.hasStrings || pasteboard.hasURLs,
-              let text = pasteboard.string else { return }
+              let text = pasteboard.string ?? pasteboard.url?.absoluteString else { return }
         let links = XHSURLDetector.extract(from: text)
         guard !links.isEmpty else {
-            UserDefaults.standard.removeObject(forKey: linksKey)
+            defaults.removeObject(forKey: linksKey)
             return
         }
         // Universal Clipboard, app switches, or device reboot can bump or reset
         // changeCount while the pasteboard still holds the exact same handled links.
-        guard UserDefaults.standard.stringArray(forKey: linksKey) != links else { return }
-        UserDefaults.standard.set(links, forKey: linksKey)
+        guard defaults.stringArray(forKey: linksKey) != links else { return }
+        defaults.set(links, forKey: linksKey)
         // The clipboard has no action picker, so it follows the user's default:
         // direct download unless "choose content" is enabled in settings.
         _ = submit { await self.accept(ImportRequest(text: text, source: .clipboard, behavior: .useSettings)) }
@@ -907,12 +1176,13 @@ final class DownloadCoordinator: ObservableObject {
         isWritingClipboard = true
         defer { isWritingClipboard = false }
         UIPasteboard.general.string = text
-        UserDefaults.standard.set(UIPasteboard.general.changeCount, forKey: "clipboard.lastHandledChange")
+        let defaults = UserDefaults.standard
+        defaults.set(UIPasteboard.general.changeCount, forKey: "clipboard.lastHandledChange")
         let links = XHSURLDetector.extract(from: text)
         if links.isEmpty {
-            UserDefaults.standard.removeObject(forKey: "clipboard.lastHandledLinks")
+            defaults.removeObject(forKey: "clipboard.lastHandledLinks")
         } else {
-            UserDefaults.standard.set(links, forKey: "clipboard.lastHandledLinks")
+            defaults.set(links, forKey: "clipboard.lastHandledLinks")
         }
         AppFeedback.play(.copy)
     }
@@ -929,14 +1199,25 @@ final class DownloadCoordinator: ObservableObject {
         guard let task = task(for: taskID),
               [.queued, .downloading, .waitingForUser].contains(task.status) else { return }
         jobs[taskID]?.cancel()
-        update(taskID) { task in task.status = .paused; task.errorMessage = nil }
+        update(taskID) { task in
+            task.status = .paused
+            task.errorMessage = nil
+            task.bytesPerSecond = 0
+            if var results = task.resourceResults {
+                for key in results.keys {
+                    results[key]?.speed = 0
+                    if results[key]?.state == .downloading { results[key]?.state = .queued }
+                }
+                task.resourceResults = results
+            }
+        }
         if selectionState?.taskID == taskID { selectionState = nil }
         schedule()
         if feedback { AppFeedback.play(.deactivation) }
     }
 
     func retry(taskID: UUID, feedback: Bool = true) {
-        guard jobs[taskID] == nil, let task = task(for: taskID),
+        guard !deletingTaskIDs.contains(taskID), let task = task(for: taskID),
               [.paused, .cancelled, .failed, .partial].contains(task.status) else { return }
         update(taskID) { task in
             if task.status == .failed || task.status == .partial
@@ -944,17 +1225,27 @@ final class DownloadCoordinator: ObservableObject {
             task.status = .queued
             task.failedCount = 0
             task.errorMessage = nil
+            task.bytesPerSecond = 0
         }
         schedule()
         if feedback { AppFeedback.play(.confirmation) }
     }
 
     func deleteTask(taskID: UUID, deletePhotos: Bool) async {
+        deletingTaskIDs.insert(taskID)
+        defer { deletingTaskIDs.remove(taskID) }
         stop(taskID: taskID, feedback: false)
         await jobs[taskID]?.value
+        componentProgress[taskID] = nil
         guard let task = task(for: taskID) else { return }
         if deletePhotos {
-            let identifiers = task.mediaAssets.map(\.localIdentifier).filter { !$0.hasPrefix("file:") }
+            let ownNoteKey = task.noteKey ?? storedNote(from: task)?.id
+            let protectedPhotoIDs = protectedReferences(
+                excludingNotes: ownNoteKey.map { [$0] } ?? [],
+                excludingTasks: [taskID]
+            ).photoIDs
+            let identifiers = task.mediaAssets.map(\.localIdentifier)
+                .filter { !$0.hasPrefix("file:") && !protectedPhotoIDs.contains($0) }
             if !identifiers.isEmpty {
                 do { try await photoLibrary.deleteAssets(localIdentifiers: identifiers) }
                 catch {
@@ -970,48 +1261,93 @@ final class DownloadCoordinator: ObservableObject {
             try? FileManager.default.removeItem(atPath: path)
         }
         tasks.removeAll { $0.id == taskID }
+        let keepKeys = tasks.filter { $0.status == .queued || $0.status == .downloading }
+            .reduce(into: Set<String>()) { $0.formUnion(expectedBackgroundTransferKeys(for: $1)) }
+        BackgroundTransfers.shared.cancelUnattachedTransfers(preservingKeys: keepKeys)
         if await persistNotes().value { AppFeedback.play(.success) }
     }
 
     func clearHistory() {
         let ids = Set(tasks.map(\.id))
         guard !ids.isEmpty else { return }
+        deletingTaskIDs.formUnion(ids)
         for id in ids { stop(taskID: id, feedback: false) }
-        for id in ids { syncNote(for: id, refreshContent: false) }
         Task {
+            defer { deletingTaskIDs.subtract(ids) }
             for id in ids { await jobs[id]?.value }
+            for id in ids { syncNote(for: id, refreshContent: false) }
             for task in tasks where ids.contains(task.id) {
                 for path in task.stagedFiles?.values ?? Dictionary<String, String>().values {
                     try? FileManager.default.removeItem(atPath: path)
                 }
             }
             tasks.removeAll { ids.contains($0.id) }
-            let saved = persist()
+            BackgroundTransfers.shared.cancelUnattachedTransfers(clearCache: true)
+            let saved = persistNotes()
             if await saved.value { AppFeedback.play(.success) }
         }
     }
 
-    /// Called after Photos deletion. Both task rows and stored notes must forget
-    /// the asset, otherwise the feed would render a dead identifier.
+    /// Called after Photos or Files deletion. Both task rows and stored notes
+    /// must forget deleted assets (including partial component deletions),
+    /// otherwise the feed would render a dead identifier.
     func removeMediaReferences(_ identifiers: Set<String>) {
+        guard !identifiers.isEmpty else { return }
+        let deletedPhotoIDs = Set(identifiers.filter { !$0.hasPrefix("file:") && !$0.isEmpty })
+        let deletedPaths = Set(
+            identifiers
+                .filter { $0.hasPrefix("file:") }
+                .flatMap { ArchiveAccess.paths(in: $0) }
+                .map(ArchiveGrant.normalizedPath)
+        )
         func remaining(_ assets: [MediaAssetRecord]) -> [MediaAssetRecord] {
             assets.compactMap { asset in
                 var asset = asset
-                let paths = asset.filesPaths ?? []
-                let fileID = "file:" + paths.joined(separator: "\n")
-                if identifiers.contains(asset.localIdentifier) {
-                    guard !asset.localIdentifier.hasPrefix("file:"), !paths.isEmpty,
-                          !identifiers.contains(fileID) else { return nil }
+                let originalPaths = asset.archivePaths
+                let survivingPaths = originalPaths.filter {
+                    !deletedPaths.contains(ArchiveGrant.normalizedPath($0))
+                }
+                if asset.localIdentifier.hasPrefix("file:") {
+                    if identifiers.contains(asset.localIdentifier) || survivingPaths.isEmpty {
+                        return nil
+                    }
+                    if survivingPaths.count != originalPaths.count {
+                        asset.filesPaths = survivingPaths
+                        asset.localIdentifier = "file:" + survivingPaths.joined(separator: "\n")
+                        if let reused = asset.reusedFilesPaths {
+                            let remainingReused = reused.filter { !deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+                            asset.reusedFilesPaths = remainingReused.isEmpty ? nil : remainingReused
+                        }
+                    }
+                    return asset
+                }
+                if let existingFiles = asset.filesPaths, !existingFiles.isEmpty {
+                    let remainingFiles = existingFiles.filter { !deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+                    asset.filesPaths = remainingFiles.isEmpty ? nil : remainingFiles
+                    if let reused = asset.reusedFilesPaths {
+                        let remainingReused = reused.filter { !deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+                        asset.reusedFilesPaths = remainingReused.isEmpty ? nil : remainingReused
+                    }
+                }
+                if deletedPhotoIDs.contains(asset.localIdentifier) {
+                    guard let remainingFiles = asset.filesPaths, !remainingFiles.isEmpty else { return nil }
                     // The Photos copy is gone, but its archived original survives.
-                    asset.localIdentifier = fileID
-                } else if !paths.isEmpty, identifiers.contains(fileID) { asset.filesPaths = nil }
+                    asset.localIdentifier = "file:" + remainingFiles.joined(separator: "\n")
+                }
                 return asset
             }
         }
-        for index in tasks.indices { tasks[index].mediaAssets = remaining(tasks[index].mediaAssets) }
+        for index in tasks.indices {
+            tasks[index].mediaAssets = remaining(tasks[index].mediaAssets)
+            tasks[index].archiveTextPaths?.removeAll { deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+            tasks[index].reusedArchiveTextPaths?.removeAll { deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+            if tasks[index].reusedArchiveTextPaths?.isEmpty == true { tasks[index].reusedArchiveTextPaths = nil }
+        }
         for index in notes.indices {
             notes[index].mediaAssets = remaining(notes[index].mediaAssets)
-            notes[index].archiveTextPaths.removeAll { identifiers.contains("file:" + $0) }
+            notes[index].archiveTextPaths.removeAll { deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+            notes[index].reusedArchiveTextPaths?.removeAll { deletedPaths.contains(ArchiveGrant.normalizedPath($0)) }
+            if notes[index].reusedArchiveTextPaths?.isEmpty == true { notes[index].reusedArchiveTextPaths = nil }
         }
         persistNotes()
     }
@@ -1034,10 +1370,20 @@ final class DownloadCoordinator: ObservableObject {
     }
 
     func showSelection(taskID: UUID) {
-        guard let task = task(for: taskID), let media = task.resolvedNote?.media else { return }
+        guard let task = task(for: taskID), let allMedia = task.resolvedNote?.media else { return }
+        let policy = task.policy ?? settings.policy
+        let filtered = allMedia.filter { policy.includes($0) }
+        let media = filtered.isEmpty ? allMedia : filtered
+        guard !media.isEmpty else { return }
         selectionState = SelectiveDownloadState(taskID: taskID, phase: .ready, items: media.map {
             SelectiveMediaItem(id: $0.id, remote: $0, cachedURL: $0.previewURL ?? $0.url, isSelected: task.draftSelectionIDs?.contains($0.stableID) ?? true)
         })
+    }
+
+    private func showNextWaitingSelection() {
+        guard selectionState == nil,
+              let next = tasks.reversed().first(where: { $0.status == .waitingForUser }) else { return }
+        showSelection(taskID: next.id)
     }
 
     func cancelSelection() {
@@ -1045,6 +1391,7 @@ final class DownloadCoordinator: ObservableObject {
         selectionState = nil
         update(state.taskID) { $0.status = .cancelled }
         schedule()
+        showNextWaitingSelection()
         AppFeedback.play(.deactivation)
     }
 
@@ -1060,6 +1407,7 @@ final class DownloadCoordinator: ObservableObject {
         }
         selectionState = nil
         schedule()
+        showNextWaitingSelection()
         AppFeedback.play(.confirmation)
     }
 
@@ -1331,13 +1679,18 @@ final class DownloadCoordinator: ObservableObject {
         // Capabilities and credentials never come from a file.
         policy.filesBookmark = settings.policy.filesBookmark
         policy.proxy = settings.policy.proxy
+        policy.namingEnabled = backup.namingEnabled
+        policy.namingTemplate = backup.namingTemplate
+        policy.namingTimezone = backup.namingTimeZone
         settings.policy = policy
         settings.livePhotoMode = backup.livePhotoMode
         settings.selectiveDownload = backup.selectiveDownload
         settings.notifications = backup.notifications
         settings.debugNotifications = backup.debugNotifications
         settings.haptics = backup.haptics
-        settings.appearance = backup.appearance
+        if ["system", "light", "dark"].contains(backup.appearance) {
+            settings.appearance = backup.appearance
+        }
         settings.keepScreenAwake = backup.keepScreenAwake
         settings.clipboardSuggestions = backup.clipboardSuggestions
         settings.defaults.set(backup.namingEnabled, forKey: NamingPreferences.enableKey)
@@ -1346,11 +1699,15 @@ final class DownloadCoordinator: ObservableObject {
     }
 
     private func schedule() {
-        guard isLoaded, jobs.isEmpty, let task = tasks.reversed().first(where: { $0.status == .queued && !pendingAdmissions.contains($0.id) }) else { return }
+        guard isLoaded, jobs.isEmpty,
+              let task = tasks.reversed().first(where: {
+                  $0.status == .queued && !pendingAdmissions.contains($0.id) && !deletingTaskIDs.contains($0.id)
+              }) else { return }
         let id = task.id
         jobs[id] = Task { [weak self] in
             guard let self else { return }
             await self.run(taskID: id)
+            self.componentProgress[id] = nil
             await self.flushPersistence()
             self.jobs[id] = nil
             self.schedule()
@@ -1416,7 +1773,20 @@ final class DownloadCoordinator: ObservableObject {
                 return
             }
 
+            let policyEligible = note.media.filter { policy.includes($0) }
             if (task.selectionRequired ?? settings.selectiveDownload) && task.selectedMediaIDs == nil {
+                if policyEligible.isEmpty {
+                    let filtered = !note.media.isEmpty
+                    update(taskID) { record in
+                        record.status = .completed
+                        record.progress = 1
+                        record.phase = TaskPhase.finished.rawValue
+                        record.mediaCount = 0
+                        record.bytesPerSecond = 0
+                        record.errorMessage = L10n.text(filtered ? "error.no_media_filtered" : "error.no_media_selected")
+                    }
+                    return
+                }
                 update(taskID) {
                     $0.status = .waitingForUser
                     $0.phase = TaskPhase.waitingSelection.rawValue
@@ -1425,8 +1795,10 @@ final class DownloadCoordinator: ObservableObject {
                 return
             }
             let selected = note.media.filter { media in
-                guard policy.includes(media) else { return false }
-                return task.selectedMediaIDs == nil || task.selectedMediaIDs!.contains(media.stableID)
+                if let explicit = task.selectedMediaIDs {
+                    return explicit.contains(media.stableID)
+                }
+                return policy.includes(media)
             }
             let media = selected.map { $0.applying(policy, variantID: task.selectedVariants?[$0.stableID]) }
             update(taskID) { record in
@@ -1439,16 +1811,18 @@ final class DownloadCoordinator: ObservableObject {
                 record.resourceResults = results
             }
             if media.isEmpty {
+                let filtered = !note.media.isEmpty && task.selectedMediaIDs == nil
                 update(taskID) { record in
                     record.status = .completed
                     record.progress = 1
-                    record.errorMessage = L10n.text("error.no_media_selected")
+                    record.phase = TaskPhase.finished.rawValue
+                    record.bytesPerSecond = 0
+                    record.errorMessage = L10n.text(filtered ? "error.no_media_filtered" : "error.no_media_selected")
                 }
-                await postNotification(taskID: taskID, success: true)
                 return
             }
             update(taskID) { $0.phase = TaskPhase.transferring.rawValue }
-            try await downloadAndSave(media, taskID: taskID)
+            try await downloadAndSave(media, taskID: taskID, taskDownloader: taskDownloader)
         } catch is CancellationError {
             // Pause/delete set the final state before cancellation. The old job
             // must exit before the scheduler or retry may launch another one.
@@ -1482,9 +1856,16 @@ final class DownloadCoordinator: ObservableObject {
             do {
                 let directory = try await FileArchiver.shared.prepare(note: note, policy: policy)
                 do {
-                    let written = try await FileArchiver.shared.writeCaptions(note: note, in: directory, policy: policy)
+                    let captions = try await FileArchiver.shared.archiveCaptions(note: note, in: directory, policy: policy)
                     await FileArchiver.shared.release(directory)
-                    if !written.isEmpty { update(taskID) { $0.archiveTextPaths = written } }
+                    if !captions.written.isEmpty {
+                        update(taskID) { record in
+                            record.archiveTextPaths = captions.written
+                            if !captions.reused.isEmpty {
+                                record.reusedArchiveTextPaths = Array(Set((record.reusedArchiveTextPaths ?? []) + captions.reused)).sorted()
+                            }
+                        }
+                    }
                 } catch {
                     await FileArchiver.shared.release(directory)
                     throw error
@@ -1495,11 +1876,14 @@ final class DownloadCoordinator: ObservableObject {
                 update(taskID) { $0.errorMessage = error.localizedDescription }
             }
         }
+        try Task.checkCancellation()
+        guard task(for: taskID)?.status == .downloading else { return }
         update(taskID) { record in
             record.status = .completed
             record.progress = 1
             record.savedCount = 0
             record.failedCount = 0
+            record.bytesPerSecond = 0
             record.phase = nil
         }
         // "Save note only" must reach the library through the same path as any
@@ -1508,20 +1892,39 @@ final class DownloadCoordinator: ObservableObject {
         await postNotification(taskID: taskID, success: true)
     }
 
-    private func stagedFile(_ media: RemoteMedia, taskID: UUID, key: String) async throws -> URL {
+    private func aggregateComponentProgress(taskID: UUID, parentKey: String) -> (received: Int64, expected: Int64, speed: Double) {
+        let components = (componentProgress[taskID] ?? [:]).values.filter { $0.parentKey == parentKey }
+        let received = components.reduce(Int64(0)) { $0 + $1.received }
+        let expected = components.reduce(Int64(0)) { $0 + $1.expected }
+        let speed = components.reduce(0.0) { $0 + $1.speed }
+        return (received, expected, speed)
+    }
+
+    private func stagedFile(_ media: RemoteMedia, taskID: UUID, key: String,
+                            progressKey: String? = nil, activeDownloader: XHSDownloader? = nil) async throws -> URL {
+        let targetProgressKey = progressKey ?? key
         if let path = task(for: taskID)?.stagedFiles?[key], FileManager.default.fileExists(atPath: path) {
+            let size = (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            if size > 0 {
+                componentProgress[taskID, default: [:]][key] = (targetProgressKey, size, size, 0)
+            }
             return URL(fileURLWithPath: path)
         }
-        updateResource(taskID: taskID, key: key) { $0.state = .downloading }
-        let activeDownloader = task(for: taskID).map { downloader(for: $0) } ?? downloader
-        let file = try await activeDownloader.download(media: media, sessionTimestamp: activeDownloader.makeSessionTimestamp(),
+        updateResource(taskID: taskID, key: targetProgressKey) { $0.state = .downloading }
+        let downloaderToUse = activeDownloader ?? (task(for: taskID).map { downloader(for: $0) } ?? downloader)
+        let file = try await downloaderToUse.download(media: media, sessionTimestamp: downloaderToUse.makeSessionTimestamp(),
             transferIdentity: taskID.uuidString + ":" + key) { [weak self] progress in
                 guard let owner = self else { return }
                 Task { @MainActor in
-                    owner.updateResource(taskID: taskID, key: key, persist: .deferred) {
-                        $0.received = progress.received
-                        $0.expected = progress.expected
-                        $0.speed = progress.bytesPerSecond
+                    guard owner.task(for: taskID)?.status == .downloading else { return }
+                    owner.componentProgress[taskID, default: [:]][key] = (
+                        targetProgressKey, progress.received, progress.expected, progress.bytesPerSecond
+                    )
+                    let total = owner.aggregateComponentProgress(taskID: taskID, parentKey: targetProgressKey)
+                    owner.updateResource(taskID: taskID, key: targetProgressKey, persist: .deferred) {
+                        $0.received = total.received
+                        $0.expected = total.expected
+                        $0.speed = total.speed
                     }
                     // Sum across resources. Writing the last callback directly
                     // made the task total jump between concurrent files.
@@ -1535,6 +1938,20 @@ final class DownloadCoordinator: ObservableObject {
                     }
                 }
             }
+        let finalSize = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        let existing = componentProgress[taskID]?[key]
+        componentProgress[taskID, default: [:]][key] = (
+            targetProgressKey,
+            max(existing?.received ?? 0, finalSize),
+            max(existing?.expected ?? 0, finalSize),
+            0
+        )
+        let settledTotal = aggregateComponentProgress(taskID: taskID, parentKey: targetProgressKey)
+        updateResource(taskID: taskID, key: targetProgressKey, persist: .deferred) {
+            $0.received = settledTotal.received
+            $0.expected = settledTotal.expected
+            $0.speed = settledTotal.speed
+        }
         update(taskID) { task in
             if task.stagedFiles == nil { task.stagedFiles = [:] }
             task.stagedFiles?[key] = file.path
@@ -1568,7 +1985,8 @@ final class DownloadCoordinator: ObservableObject {
     }
 
     private func recordAsset(file: URL, isVideo: Bool, key: String, taskID: UUID, paired: URL? = nil,
-                             originalName: String? = nil, files: [String] = []) async throws {
+                             originalName: String? = nil, files: [String] = [],
+                             reusedFiles: [String] = []) async throws {
         if task(for: taskID)?.mediaAssets.contains(where: { $0.sourceMediaID == key }) == true { return }
         let metadata = await MediaFileMetadata.read(url: file, isVideo: isVideo)
         let stagedName = file.lastPathComponent
@@ -1587,17 +2005,23 @@ final class DownloadCoordinator: ObservableObject {
             var record = MediaAssetRecord(localIdentifier: identifier, fileName: fileName, isVideo: isVideo,
                 pixelWidth: metadata.pixelWidth, pixelHeight: metadata.pixelHeight, byteCount: metadata.byteCount)
             record.sourceMediaID = key
+            if paired != nil { record.isLive = true }
             if !files.isEmpty { record.filesPaths = files }
+            if !reusedFiles.isEmpty { record.reusedFilesPaths = reusedFiles }
             task.mediaAssets.append(record)
         }
     }
 
     /// Files-only saves have no Photos asset. The record keeps the archived
     /// path so the note feed, the detail view and deletion can still find it.
-    private func recordArchivedAsset(paths: [String], isVideo: Bool, isLive: Bool, key: String,
+    private func recordArchivedAsset(paths: [String], reusedPaths: [String] = [],
+                                     isVideo: Bool, isLive: Bool, key: String,
                                      taskID: UUID, fileName: String?) async throws {
         guard let first = paths.first else { return }
-        if task(for: taskID)?.mediaAssets.contains(where: { $0.sourceMediaID == key }) == true { return }
+        if task(for: taskID)?.mediaAssets.contains(where: { $0.sourceMediaID == key }) == true {
+            attachArchivedPaths(paths, reusedPaths: reusedPaths, key: key, taskID: taskID)
+            return
+        }
         let metadata = await MediaFileMetadata.read(url: URL(fileURLWithPath: first), isVideo: isVideo)
         let name = fileName ?? URL(fileURLWithPath: first).lastPathComponent
         // The identifier carries every component path so a Live Photo can play its
@@ -1608,6 +2032,7 @@ final class DownloadCoordinator: ObservableObject {
                 pixelWidth: metadata.pixelWidth, pixelHeight: metadata.pixelHeight, byteCount: metadata.byteCount)
             record.sourceMediaID = key
             record.filesPaths = paths
+            if !reusedPaths.isEmpty { record.reusedFilesPaths = reusedPaths }
             record.isLive = isLive
             task.mediaAssets.append(record)
         }
@@ -1615,19 +2040,27 @@ final class DownloadCoordinator: ObservableObject {
 
     /// Writes archive paths onto an existing media record. Used when the Files
     /// destination is filled in after the Photos half already succeeded.
-    private func attachArchivedPaths(_ paths: [String], key: String, taskID: UUID) {
+    private func attachArchivedPaths(_ paths: [String], reusedPaths: [String] = [], key: String, taskID: UUID) {
         guard !paths.isEmpty else { return }
         update(taskID) { task in
             guard let index = task.mediaAssets.firstIndex(where: {
                 $0.sourceMediaID == key || $0.sourceMediaID == key + ":still"
             }) else { return }
-            var merged = Set(task.mediaAssets[index].filesPaths ?? [])
-            merged.formUnion(paths)
-            task.mediaAssets[index].filesPaths = Array(merged).sorted()
+            var merged = task.mediaAssets[index].filesPaths ?? []
+            for path in paths where !merged.contains(path) { merged.append(path) }
+            task.mediaAssets[index].filesPaths = merged
+            if task.mediaAssets[index].localIdentifier.hasPrefix("file:") {
+                task.mediaAssets[index].localIdentifier = "file:" + merged.joined(separator: "\n")
+            }
+            if !reusedPaths.isEmpty {
+                var reused = Set(task.mediaAssets[index].reusedFilesPaths ?? [])
+                reused.formUnion(reusedPaths)
+                task.mediaAssets[index].reusedFilesPaths = Array(reused).sorted()
+            }
         }
     }
 
-    private func downloadAndSave(_ media: [RemoteMedia], taskID: UUID) async throws {
+    private func downloadAndSave(_ media: [RemoteMedia], taskID: UUID, taskDownloader: XHSDownloader) async throws {
         let record = task(for: taskID)
         let policy = record?.policy ?? settings.policy
         let mode = record?.livePhotoMode ?? ((record?.livePhotoEnabled ?? settings.createLivePhotos) ? .merged : .separate)
@@ -1656,12 +2089,20 @@ final class DownloadCoordinator: ObservableObject {
         do {
             counts = try await transfer(media, taskID: taskID, policy: policy, mode: mode,
                                         wantsPhotos: wantsPhotos, wantsFiles: wantsFiles,
-                                        archive: archiveDirectory, archiveError: archiveError)
+                                        archive: archiveDirectory, archiveError: archiveError,
+                                        taskDownloader: taskDownloader)
             if wantsFiles, let archiveDirectory, let note = record?.resolvedNote,
                policy.captionFormat != .none {
                 do {
-                    let written = try await FileArchiver.shared.writeCaptions(note: note, in: archiveDirectory, policy: policy)
-                    if !written.isEmpty { update(taskID) { $0.archiveTextPaths = written } }
+                    let captions = try await FileArchiver.shared.archiveCaptions(note: note, in: archiveDirectory, policy: policy)
+                    if !captions.written.isEmpty {
+                        update(taskID) { record in
+                            record.archiveTextPaths = captions.written
+                            if !captions.reused.isEmpty {
+                                record.reusedArchiveTextPaths = Array(Set((record.reusedArchiveTextPaths ?? []) + captions.reused)).sorted()
+                            }
+                        }
+                    }
                 } catch {
                     // Captions are a side artifact: media already landed, so the
                     // failure is reported without demoting the whole task.
@@ -1685,7 +2126,8 @@ final class DownloadCoordinator: ObservableObject {
         wantsPhotos: Bool,
         wantsFiles: Bool,
         archive: FileArchiver.ResolvedDirectory?,
-        archiveError: Error?
+        archiveError: Error?,
+        taskDownloader: XHSDownloader
     ) async throws -> (saved: Int, failed: Int) {
         var completed = Set(task(for: taskID)?.completedMediaIDs ?? [])
         var failed = 0
@@ -1696,12 +2138,14 @@ final class DownloadCoordinator: ObservableObject {
                 for (_, item) in batch where !completed.contains(item.stableID) {
                     group.addTask { [self] in
                         do {
-                            _ = try await stagedFile(item, taskID: taskID, key: item.stableID)
+                            _ = try await stagedFile(item, taskID: taskID, key: item.stableID,
+                                                     progressKey: item.stableID, activeDownloader: taskDownloader)
                             if item.type == .livePhoto, mode != .still, let url = item.pairedVideoURLs.first {
                                 let motion = RemoteMedia(stableID: item.stableID + ":motion", url: url, type: .video,
                                     fileBaseName: item.fileBaseName + "_motion", originalURLString: url.absoluteString,
                                     candidates: item.pairedVideoURLs)
-                                _ = try await stagedFile(motion, taskID: taskID, key: motion.stableID)
+                                _ = try await stagedFile(motion, taskID: taskID, key: motion.stableID,
+                                                         progressKey: item.stableID, activeDownloader: taskDownloader)
                             }
                             return (item.stableID, nil)
                         } catch { return (item.stableID, error) }
@@ -1712,12 +2156,13 @@ final class DownloadCoordinator: ObservableObject {
                 return failures
             }
             try Task.checkCancellation()
-            for (index, item) in batch {
+            for (_, item) in batch {
                 try Task.checkCancellation()
                 if completed.contains(item.stableID) { continue }
                 do {
                     if let error = errors[item.stableID] { throw error }
-                    let photo = try await stagedFile(item, taskID: taskID, key: item.stableID)
+                    let photo = try await stagedFile(item, taskID: taskID, key: item.stableID,
+                                                     progressKey: item.stableID, activeDownloader: taskDownloader)
                     try Task.checkCancellation()
                     // A Live Photo keeps its motion component under one stable
                     // key so a resumed task can reuse the staged file.
@@ -1727,7 +2172,8 @@ final class DownloadCoordinator: ObservableObject {
                         let video = RemoteMedia(stableID: motionKey, url: videoURL, type: .video,
                             fileBaseName: item.fileBaseName + "_motion", originalURLString: videoURL.absoluteString,
                             candidates: item.pairedVideoURLs)
-                        motion = try await stagedFile(video, taskID: taskID, key: motionKey)
+                        motion = try await stagedFile(video, taskID: taskID, key: motionKey,
+                                                      progressKey: item.stableID, activeDownloader: taskDownloader)
                     }
 
                     // Files and Photos are independent destinations. Each one is
@@ -1747,15 +2193,55 @@ final class DownloadCoordinator: ObservableObject {
                     // Photos half must run again instead of being skipped.
                     let photosAlreadySaved = previous?.photos?.state == .saved
                         && (!mergeRequired || mergeAlreadyDone)
-                    let filesAlreadySaved = previous?.files?.isSettled == true
-                    let previousArchive = previous?.files?.reference
+                    let expectedCount = (motion != nil) ? 2 : 1
+                    let existingPaths = previous?.files?.allReferences ?? []
+                    let existingOnDisk = existingPaths.allSatisfy { FileManager.default.fileExists(atPath: $0) }
+                    let filesAlreadyComplete = previous?.files?.isSettled == true
+                        && existingPaths.count >= expectedCount
+                        && (archive == nil || existingOnDisk)
 
-                    var archived: [String] = filesAlreadySaved ? [previousArchive].compactMap { $0 } : []
+                    var archived: [String] = filesAlreadyComplete ? existingPaths : []
+                    var reusedArchived: [String] = previous?.files?.reusedReferences ?? []
                     var filesResult = DestinationResult()
                     var skippedFile = false
-                    if filesAlreadySaved {
+                    if filesAlreadyComplete {
                         filesResult = previous?.files ?? DestinationResult(state: .saved)
+                    } else if previous?.files?.isSettled == true,
+                              let archive,
+                              let motion,
+                              existingPaths.count == 1,
+                              FileManager.default.fileExists(atPath: existingPaths[0]) {
+                        // Legacy single-path Live Photo healing: keep the existing
+                        // still untouched (avoiding `_2` duplicates) and archive
+                        // only the missing motion component.
+                        let stillPath = existingPaths[0]
+                        let entries = [FileArchiver.Entry(file: motion, baseName: item.fileBaseName + "_motion",
+                                                          key: motionKey)]
+                        let result = try await FileArchiver.shared.archive(entries: entries, in: archive, policy: policy)
+                        if let motionPath = result.paths[motionKey] {
+                            archived = [stillPath, motionPath]
+                            if let reusedMotion = result.reused[motionKey], !reusedArchived.contains(reusedMotion) {
+                                reusedArchived.append(reusedMotion)
+                            }
+                            if policy.writePublishTime, let published = task(for: taskID)?.resolvedNote?.metadata.publishedAt {
+                                try? FileManager.default.setAttributes([.modificationDate: published],
+                                                                       ofItemAtPath: motionPath)
+                            }
+                            filesResult = previous?.files ?? DestinationResult(state: .saved)
+                            if filesResult.state != .saved && filesResult.state != .skipped {
+                                filesResult.state = result.skipped.contains(motionKey) ? .skipped : .saved
+                            }
+                            filesResult.error = nil
+                        } else {
+                            archived = [stillPath]
+                            filesResult.state = .failed
+                            filesResult.error = result.failed[motionKey] ?? L10n.text("archive.error.nodirectory")
+                        }
+                        filesResult.reference = archived.first
+                        filesResult.references = archived
+                        filesResult.reusedReferences = reusedArchived.isEmpty ? nil : reusedArchived
                     } else if let archive {
+                        reusedArchived = []
                         var entries = [FileArchiver.Entry(file: photo, baseName: item.fileBaseName, key: item.stableID)]
                         if let motion {
                             entries.append(FileArchiver.Entry(file: motion, baseName: item.fileBaseName + "_motion",
@@ -1766,6 +2252,7 @@ final class DownloadCoordinator: ObservableObject {
                         // by resource key. Matching by file name lost the real
                         // path whenever de-duplication produced "name_2.heic".
                         archived = entries.compactMap { result.paths[$0.key] }
+                        reusedArchived = entries.compactMap { result.reused[$0.key] }
                         skippedFile = result.skipped.contains(item.stableID)
                         let failure = result.failed[item.stableID] ?? result.failed[motionKey]
                         // "Write publish time" also applies to the archived copy.
@@ -1785,6 +2272,8 @@ final class DownloadCoordinator: ObservableObject {
                             filesResult.state = skippedFile ? .skipped : .saved
                         }
                         filesResult.reference = archived.first
+                        filesResult.references = archived.isEmpty ? nil : archived
+                        filesResult.reusedReferences = reusedArchived.isEmpty ? nil : reusedArchived
                     } else if archiveError != nil {
                         filesResult.state = .failed
                         filesResult.error = archiveError?.localizedDescription
@@ -1800,7 +2289,7 @@ final class DownloadCoordinator: ObservableObject {
                         do {
                             let outcome = try await saveToPhotos(
                                 item, photo: photo, motion: motion, motionKey: motionKey, mode: mode,
-                                archived: archived, taskID: taskID)
+                                archived: archived, reusedArchived: reusedArchived, taskID: taskID)
                             photosResult.state = .saved
                             photosResult.reference = task(for: taskID)?.mediaAssets
                                 .last { $0.sourceMediaID == item.stableID || $0.sourceMediaID == item.stableID + ":still" }?
@@ -1819,18 +2308,21 @@ final class DownloadCoordinator: ObservableObject {
                     // paths to the media record the Photos half created earlier.
                     if wantsPhotos, photosAlreadySaved, !archived.isEmpty,
                        filesResult.state == .saved || filesResult.state == .skipped {
-                        attachArchivedPaths(archived, key: item.stableID, taskID: taskID)
+                        attachArchivedPaths(archived, reusedPaths: reusedArchived, key: item.stableID, taskID: taskID)
                     }
 
                     // Files-only saves still need a media record, otherwise the
                     // note has no media to browse and the archive looks empty.
                     if !wantsPhotos, filesResult.state == .saved || filesResult.state == .skipped,
                        !archived.isEmpty {
-                        try await recordArchivedAsset(paths: archived, isVideo: item.isVideo,
+                        try await recordArchivedAsset(paths: archived, reusedPaths: reusedArchived,
+                                                      isVideo: item.isVideo,
                                                       isLive: item.type == .livePhoto && mode != .still,
                                                       key: item.stableID, taskID: taskID,
                                                       fileName: item.fileBaseName + "." + photo.pathExtension)
                         filesResult.reference = archived.first
+                        filesResult.references = archived
+                        filesResult.reusedReferences = reusedArchived.isEmpty ? nil : reusedArchived
                     }
 
                     let outcome = mergeRequired
@@ -1839,7 +2331,7 @@ final class DownloadCoordinator: ObservableObject {
                     let settled = ResourceResult(
                         state: .saved,
                         photos: wantsPhotos ? photosResult : nil,
-                        files: archive != nil || archiveError != nil ? filesResult : nil,
+                        files: wantsFiles ? filesResult : nil,
                         livePhotoOutcome: outcome)
                     // Completion is decided by what the user asked for, never by
                     // whether the folder happened to be available: a failed Files
@@ -1859,7 +2351,7 @@ final class DownloadCoordinator: ObservableObject {
                         task.completedMediaIDs = Array(completed)
                         task.savedCount = saved
                         task.failedCount = failed
-                        task.progress = Double(index + 1) / Double(media.count)
+                        task.progress = Double(saved + failed) / Double(max(1, media.count))
                         // Keep staged originals when a destination is still
                         // missing, so a retry does not download them again.
                         if satisfied {
@@ -1873,8 +2365,9 @@ final class DownloadCoordinator: ObservableObject {
                     }
                     updateResource(taskID: taskID, key: item.stableID) { entry in
                         entry.state = satisfied ? .saved : .failed
+                        entry.speed = 0
                         entry.photos = wantsPhotos ? photosResult : nil
-                        entry.files = archive != nil || archiveError != nil ? filesResult : nil
+                        entry.files = wantsFiles ? filesResult : nil
                         entry.error = satisfied ? nil : (settled.files?.error ?? settled.photos?.error
                             ?? L10n.text("error.live_pair"))
                         if mergeRequired, outcome != .merged {
@@ -1891,12 +2384,13 @@ final class DownloadCoordinator: ObservableObject {
                     failed += 1
                     update(taskID) { task in
                         task.failedCount = failed
-                        task.progress = Double(index + 1) / Double(media.count)
+                        task.progress = Double(saved + failed) / Double(max(1, media.count))
                         task.errorMessage = error.localizedDescription
                     }
                     let message = error.localizedDescription
                     updateResource(taskID: taskID, key: item.stableID) {
                         $0.state = .failed
+                        $0.speed = 0
                         $0.error = message
                     }
                 }
@@ -1912,13 +2406,17 @@ final class DownloadCoordinator: ObservableObject {
     /// retryable instead of being counted as saved twice.
     @discardableResult
     private func saveToPhotos(_ item: RemoteMedia, photo: URL, motion: URL?, motionKey: String,
-                              mode: LivePhotoMode, archived: [String],
+                              mode: LivePhotoMode, archived: [String], reusedArchived: [String] = [],
                               taskID: UUID) async throws -> LivePhotoOutcome? {
         guard item.type == .livePhoto, mode != .still, let motion else {
             try await recordAsset(file: photo, isVideo: item.isVideo, key: item.stableID, taskID: taskID,
-                                  files: archived)
+                                  files: archived, reusedFiles: reusedArchived)
             return item.type == .livePhoto ? .componentsOnly : nil
         }
+        let stillArchived = archived.first.map { [$0] } ?? []
+        let motionArchived = archived.count > 1 ? Array(archived.dropFirst()) : []
+        let stillReused = reusedArchived.filter { stillArchived.contains($0) }
+        let motionReused = reusedArchived.filter { motionArchived.contains($0) }
         if mode == .merged {
             do {
                 let pair = try await LivePhotoPairer.pair(photo: photo, video: motion)
@@ -1930,7 +2428,7 @@ final class DownloadCoordinator: ObservableObject {
                 try await recordAsset(file: pair.photo, isVideo: false, key: item.stableID, taskID: taskID,
                                       paired: pair.video,
                                       originalName: item.fileBaseName + "." + pair.photo.pathExtension,
-                                      files: archived)
+                                      files: archived, reusedFiles: reusedArchived)
                 return .merged
             } catch is CancellationError { throw CancellationError() }
             catch {
@@ -1938,14 +2436,16 @@ final class DownloadCoordinator: ObservableObject {
                 // so "retry failed items" can attempt the merge again.
                 try Task.checkCancellation()
                 try await recordAsset(file: photo, isVideo: false, key: item.stableID + ":still", taskID: taskID,
-                                      files: archived)
-                try await recordAsset(file: motion, isVideo: true, key: motionKey, taskID: taskID)
+                                      files: stillArchived, reusedFiles: stillReused)
+                try await recordAsset(file: motion, isVideo: true, key: motionKey, taskID: taskID,
+                                      files: motionArchived, reusedFiles: motionReused)
                 return .componentsOnly
             }
         }
         try await recordAsset(file: photo, isVideo: false, key: item.stableID + ":still", taskID: taskID,
-                              files: archived)
-        try await recordAsset(file: motion, isVideo: true, key: motionKey, taskID: taskID)
+                              files: stillArchived, reusedFiles: stillReused)
+        try await recordAsset(file: motion, isVideo: true, key: motionKey, taskID: taskID,
+                              files: motionArchived, reusedFiles: motionReused)
         return .componentsOnly
     }
 
@@ -1956,11 +2456,27 @@ final class DownloadCoordinator: ObservableObject {
             task.savedCount = saved
             task.failedCount = failed
             task.progress = 1
+            task.bytesPerSecond = 0
             if saved == expected && failed == 0 {
                 task.status = .completed
             } else {
-                task.status = saved > 0 ? .partial : .failed
-                task.errorMessage = task.errorMessage ?? L10n.format("error.partial_failure", saved, expected)
+                let results = Array((task.resourceResults ?? [:]).values)
+                let photosSaved = results.contains { $0.photos?.isSettled == true }
+                let filesSaved = results.contains { $0.files?.isSettled == true }
+                let photosFailed = results.contains { $0.photos?.state == .failed }
+                let filesFailed = results.contains { $0.files?.state == .failed }
+                task.status = (saved > 0 || (task.policy?.destination == .both && (photosSaved || filesSaved))) ? .partial : .failed
+                if task.policy?.destination == .both {
+                    if photosSaved && filesFailed && !photosFailed {
+                        task.errorMessage = L10n.text("error.partial_photos_saved_files_failed")
+                    } else if filesSaved && photosFailed && !filesFailed {
+                        task.errorMessage = L10n.text("error.partial_files_saved_photos_failed")
+                    } else {
+                        task.errorMessage = task.errorMessage ?? L10n.format("error.partial_failure", saved, expected)
+                    }
+                } else {
+                    task.errorMessage = task.errorMessage ?? L10n.format("error.partial_failure", saved, expected)
+                }
             }
         }
         Task { await postNotification(taskID: taskID, success: failed == 0 && saved == expected) }
@@ -1999,7 +2515,10 @@ final class DownloadCoordinator: ObservableObject {
     }
 
     private func inferNoteType(_ media: [RemoteMedia]) -> NoteType {
-        let types = Set(media.map(\.type))
+        let primary = media.filter { ($0.role ?? .body) == .body }
+        let items = primary.isEmpty ? media : primary
+        let types = Set(items.map(\.type))
+        if types.isEmpty { return .unknown }
         if types == [.image] { return .image }
         if types == [.video] { return .video }
         if types == [.livePhoto] { return .livePhoto }
@@ -2092,15 +2611,91 @@ final class DownloadCoordinator: ObservableObject {
         return write
     }
 
-    private func recoverInterruptedTasks() {
+    private func expectedBackgroundTransferKeys(for task: DownloadTaskRecord) -> Set<String> {
+        guard let note = task.resolvedNote else { return [] }
+        let policy = task.policy ?? settings.policy
+        let completed = Set(task.completedMediaIDs ?? [])
+        let mode = task.livePhotoMode ?? ((task.livePhotoEnabled ?? settings.createLivePhotos) ? .merged : .separate)
+        var keys = Set<String>()
+        for raw in note.media {
+            if let explicit = task.selectedMediaIDs {
+                guard explicit.contains(raw.stableID) else { continue }
+            } else {
+                guard policy.includes(raw) else { continue }
+            }
+            guard !completed.contains(raw.stableID) else { continue }
+            let item = raw.applying(policy, variantID: task.selectedVariants?[raw.stableID])
+            let stillID = task.id.uuidString + ":" + item.stableID
+            for url in item.candidates {
+                keys.insert(BackgroundTransfers.transferKey(identity: stillID, url: url))
+            }
+            if item.type == .livePhoto, mode != .still {
+                let motionID = stillID + ":motion"
+                for url in item.pairedVideoURLs {
+                    keys.insert(BackgroundTransfers.transferKey(identity: motionID, url: url))
+                }
+            }
+        }
+        return keys
+    }
+
+    private func pauseResidualNonDownloadingTasks() {
         var changed = false
-        for index in tasks.indices where tasks[index].status == .queued || tasks[index].status == .downloading || tasks[index].status == .waitingForUser {
+        for index in tasks.indices where tasks[index].status == .queued || tasks[index].status == .waitingForUser {
             if tasks[index].status == .waitingForUser, tasks[index].resolvedNote != nil { continue }
             tasks[index].status = .paused
+            tasks[index].bytesPerSecond = 0
             tasks[index].errorMessage = L10n.text("error.interrupted")
             changed = true
         }
         if changed { persist() }
+    }
+
+    private func fetchActiveBackgroundKeys(timeout: Duration = .seconds(2)) async -> Set<String> {
+        let fetcher = activeBackgroundKeys
+        let box = BackgroundKeysTimeoutBox()
+        return await withCheckedContinuation { continuation in
+            box.attach(continuation)
+            let timeoutTask = Task {
+                try? await Task.sleep(for: timeout)
+                box.resume(with: [])
+            }
+            Task {
+                let keys = await fetcher()
+                timeoutTask.cancel()
+                box.resume(with: keys)
+            }
+        }
+    }
+
+    private func recoverInterruptedTasks() async {
+        let liveKeys = await fetchActiveBackgroundKeys()
+        var preservedKeys = Set<String>()
+        var changed = false
+        for index in tasks.indices where tasks[index].status == .queued || tasks[index].status == .downloading || tasks[index].status == .waitingForUser {
+            if tasks[index].status == .waitingForUser, tasks[index].resolvedNote != nil { continue }
+            if tasks[index].status == .downloading {
+                let taskKeys = expectedBackgroundTransferKeys(for: tasks[index])
+                if !taskKeys.isDisjoint(with: liveKeys) {
+                    // System kept this transfer alive (or finished it while suspended).
+                    // Re-queue so `schedule()` reattaches immediately instead of cancelling.
+                    tasks[index].status = .queued
+                    tasks[index].bytesPerSecond = 0
+                    tasks[index].errorMessage = nil
+                    preservedKeys.formUnion(taskKeys)
+                    changed = true
+                    continue
+                }
+            }
+            tasks[index].status = .paused
+            tasks[index].bytesPerSecond = 0
+            tasks[index].errorMessage = L10n.text("error.interrupted")
+            changed = true
+        }
+        if changed {
+            BackgroundTransfers.shared.cancelUnattachedTransfers(preservingKeys: preservedKeys)
+            persist()
+        }
     }
 
     private func cleanupSelectionFiles(_ state: SelectiveDownloadState?) {

@@ -63,11 +63,6 @@ final class MediaLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
         reload()
     }
 
-    func delete(_ identifiers: Set<String>) async throws {
-        defer { reload() }
-        try await MediaDeletionService.shared.delete(identifiers)
-    }
-
     private func reload() {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         authorized = status == .authorized || status == .limited
@@ -100,6 +95,7 @@ final class MediaLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
 struct MediaLibraryView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ObservedObject var coordinator: DownloadCoordinator
     @StateObject private var model = MediaLibraryModel()
     @StateObject private var preferences = NoteLibraryPreferences()
@@ -134,153 +130,213 @@ struct MediaLibraryView: View {
     @State private var collectionToDelete: NoteCollection?
     @State private var authorToRemark: AuthorTarget?
     @State private var remarkText = ""
+    @State private var scrollBucket: Int = 0
+    @State private var lastViewportHeight: CGFloat = 0
 
     struct AuthorTarget: Identifiable {
         let id: String
         let name: String
     }
 
+    private struct LibrarySnapshot {
+        let sortedNotes: [LibraryNote]
+        let visible: [LibraryNote]
+        let visibleIDs: Set<String>
+        let authors: [(key: String, name: String, count: Int)]
+        let selectedNotes: [LibraryNote]
+        let selectedLinks: [String]
+    }
+
     private var identifiers: [String] { coordinator.notes.flatMap(\.mediaAssets).map(\.localIdentifier) }
-    /// Notes come from the durable note store, not from task history, so removing
-    /// finished downloads cannot empty the library.
-    private var allNotes: [LibraryNote] {
-        NoteLibrary.notes(stored: coordinator.notes, media: model.assets.map(LibraryMedia.init))
-    }
-    private var notes: [LibraryNote] {
-        NoteLibrary.sorted(allNotes, by: preferences.sortOrder)
-    }
-    private var visible: [LibraryNote] {
-        notes.filter { note in
+
+    /// Computes note merging, sorting, filtering and author grouping once per
+    /// render pass instead of repeating O(N log N) passes across body subviews.
+    private func makeSnapshot() -> LibrarySnapshot {
+        let all = NoteLibrary.notes(stored: coordinator.notes,
+                                    media: model.assets.map(LibraryMedia.init),
+                                    hiddenMediaIDs: coordinator.hiddenMediaIDs)
+        let sorted = NoteLibrary.sorted(all, by: preferences.sortOrder)
+        let activeCollection = collectionFilter.flatMap { coordinator.collection($0) }
+        let visible = sorted.filter { note in
             guard note.matches(query: search, filter: filter,
                                remark: coordinator.remark(for: note.authorKey)) else { return false }
             if scope == 1, !coordinator.likedNotes.contains(note.id) { return false }
             if let authorFilter, note.authorKey != authorFilter { return false }
-            if let collectionFilter,
-               !(coordinator.collection(collectionFilter)?.noteIDs.contains(note.id) ?? false) { return false }
+            if collectionFilter != nil, !(activeCollection?.noteIDs.contains(note.id) ?? false) { return false }
             return true
         }
-    }
-    private var visibleIDs: Set<String> { Set(visible.map(\.id)) }
-    private var selectedNotes: [LibraryNote] { visible.filter { selection.contains($0.id) } }
-    private var selectedLinks: [String] { NoteLibrary.selectedLinks(in: notes, noteIDs: selection) }
-
-    /// Authors are grouped by the stable identity, so a renamed account does not
-    /// split into two entries.
-    private var authors: [(key: String, name: String, count: Int)] {
-        var seen: [String: (name: String, count: Int)] = [:]
-        for note in allNotes {
+        var authorMap: [String: (name: String, count: Int)] = [:]
+        for note in all {
             guard let key = note.authorKey else { continue }
-            var entry = seen[key] ?? (note.author, 0)
+            var entry = authorMap[key] ?? (note.author, 0)
             entry.count += 1
-            if let remark = coordinator.remark(for: key) { entry.name = remark } else { entry.name = note.author }
-            seen[key] = entry
+            entry.name = coordinator.remark(for: key) ?? note.author
+            authorMap[key] = entry
         }
-        return seen.map { (key: $0.key, name: $0.value.name, count: $0.value.count) }
+        let authors = authorMap.map { (key: $0.key, name: $0.value.name, count: $0.value.count) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let visibleIDs = Set(visible.map(\.id))
+        let selectedNotes = selection.isEmpty ? [] : visible.filter { selection.contains($0.id) }
+        let selectedLinks = selection.isEmpty ? [] : NoteLibrary.selectedLinks(in: sorted, noteIDs: selection)
+        return LibrarySnapshot(
+            sortedNotes: sorted,
+            visible: visible,
+            visibleIDs: visibleIDs,
+            authors: authors,
+            selectedNotes: selectedNotes,
+            selectedLinks: selectedLinks
+        )
     }
 
     var body: some View {
+        let snapshot = makeSnapshot()
         NavigationStack {
             GeometryReader { geometry in
+                let count = dynamicTypeSize.isAccessibilitySize && geometry.size.width < 520
+                    ? 1
+                    : max(2, Int(geometry.size.width / 260))
+                let width = (geometry.size.width - 16 - CGFloat(count - 1) * 8) / CGFloat(count)
+                let currentViewportHeight = geometry.size.height
+                let viewportH = max(currentViewportHeight > 0 ? currentViewportHeight : lastViewportHeight, 600)
+                let step = max(120, viewportH * 0.4)
+                let approxScrollY = CGFloat(scrollBucket) * step
+                let activeRange = (approxScrollY - viewportH * 1.25)...(approxScrollY + viewportH * 2.25)
+                let ranges = snapshot.visible.count > 24
+                    ? Self.estimatedVerticalRanges(for: snapshot.visible, width: width, columns: count,
+                                                   horizontalSpacing: 8, verticalSpacing: 10)
+                    : [:]
+                let masonryAnimation = XHSDesign.animation(reduceMotion, .spring(response: 0.42, dampingFraction: 0.84))
+                let visibleOrderKey = snapshot.visible.map(\.id)
                 ScrollView {
                     // Without photo access the feed still shows text notes and
                     // Files-saved media, with a compact prompt above them.
                     if !model.authorized {
                         permissionBanner
                     }
-                    if visible.isEmpty {
-                        GlassEmptyState(
-                            title: search.isEmpty ? L10n.text(scope == 1 ? "feed.bookmarks.empty" : "library.empty")
-                                                  : L10n.text("feed.search.empty"),
-                            systemImage: !search.isEmpty ? "magnifyingglass" : (scope == 1 ? "heart" : "photo.on.rectangle.angled")
-                        )
-                        .padding(.top, model.authorized ? 64 : 24)
-                    } else {
-                        let count = max(2, Int(geometry.size.width / 260))
-                        let columns = NoteLibrary.columns(visible, count: count)
-                        let width = (geometry.size.width - 16 - CGFloat(count - 1) * 8) / CGFloat(count)
-                        HStack(alignment: .top, spacing: 8) {
-                            ForEach(columns.indices, id: \.self) { index in
-                                LazyVStack(spacing: 10) {
-                                    ForEach(columns[index]) { note in
-                                        NoteFeedCard(note: note, width: width,
-                                                     selected: selection.contains(note.id),
-                                                     isSelecting: isSelecting, liked: coordinator.likedNotes.contains(note.id),
-                                                     loading: presentation.loadingIdentifier == note.cover?.id,
-                                                     previewRevision: coordinator.archiveRevision,
-                                                     namespace: previewTransition,
-                                                     heroGeometry: feedGeometry,
-                                                     onOpen: { if isSelecting { toggle(note) } else { open(note) } },
-                                                     onLike: { coordinator.toggleLike(noteID: note.id) })
-                                            .task(id: note.id) { await repairAuthor(note) }
-                                            .contextMenu {
-                                                Button { open(note) } label: { Label(L10n.text("library.open"), systemImage: "arrow.up.left.and.arrow.down.right") }
-                                                Button { isSelecting = true; selection.insert(note.id); AppFeedback.play(.selection) } label: {
-                                                    Label(L10n.text("library.select"), systemImage: "checkmark.circle")
-                                                }
-                                                let liked = coordinator.likedNotes.contains(note.id)
-                                                Button { coordinator.toggleLike(noteID: note.id) } label: {
-                                                    Label(L10n.text(liked ? "feed.bookmark.remove" : "feed.bookmark"),
-                                                          systemImage: liked ? "heart.slash" : "heart")
-                                                }
-                                                Button { exportNotes([note]) } label: { Label(L10n.text("library.notes.share"), systemImage: "square.and.arrow.up") }
-                                                if let authorKey = note.authorKey {
-                                                    Button {
-                                                        remarkText = coordinator.remark(for: authorKey) ?? ""
-                                                        authorToRemark = AuthorTarget(id: authorKey, name: note.author)
-                                                    } label: {
-                                                        Label(L10n.text("library.author.remark"), systemImage: "pencil")
-                                                    }
-                                                }
-                                                Menu {
-                                                    ForEach(coordinator.collections) { collection in
-                                                        Button {
-                                                            let ids: Set<String> = [note.id]
-                                                            let inside = coordinator.collection(collection.id)?.noteIDs.contains(note.id) ?? false
-                                                            coordinator.setMembership(ids, in: collection.id, included: !inside)
-                                                        } label: {
-                                                            Label("\((coordinator.collection(collection.id)?.noteIDs.contains(note.id) ?? false) ? "✓ " : "")  \(collection.name)",
-                                                                  systemImage: "folder")
-                                                        }
-                                                    }
-                                                    Button { newCollectionName = ""; showsNewCollection = true } label: {
-                                                        Label(L10n.text("library.collection.new"), systemImage: "plus")
+                    ZStack(alignment: .top) {
+                        MasonryLayout(columns: count, horizontalSpacing: 8, verticalSpacing: 10) {
+                            ForEach(snapshot.visible) { note in
+                                let isNearViewport = snapshot.visible.count <= 24 || (ranges[note.id]?.overlaps(activeRange) ?? true)
+                                NoteFeedCard(note: note, width: width,
+                                             selected: selection.contains(note.id),
+                                             isSelecting: isSelecting, liked: coordinator.likedNotes.contains(note.id),
+                                             loading: presentation.loadingIdentifier == note.cover?.id,
+                                             previewRevision: coordinator.archiveRevision,
+                                             isNearViewport: isNearViewport,
+                                             namespace: previewTransition,
+                                             heroGeometry: feedGeometry,
+                                             onOpen: { if isSelecting { toggle(note) } else { open(note) } },
+                                             onLike: {
+                                                 withAnimation(masonryAnimation) {
+                                                     coordinator.toggleLike(noteID: note.id)
+                                                 }
+                                             })
+                                    .task(id: isNearViewport ? note.id : "") {
+                                        guard isNearViewport else { return }
+                                        await repairAuthor(note)
+                                    }
+                                    .contextMenu {
+                                        Button { open(note) } label: { Label(L10n.text("library.open"), systemImage: "arrow.up.left.and.arrow.down.right") }
+                                        Button {
+                                            withAnimation(XHSDesign.animation(reduceMotion)) {
+                                                isSelecting = true
+                                                selection.insert(note.id)
+                                            }
+                                            AppFeedback.play(.selection)
+                                        } label: {
+                                            Label(L10n.text("library.select"), systemImage: "checkmark.circle")
+                                        }
+                                        let liked = coordinator.likedNotes.contains(note.id)
+                                        Button {
+                                            withAnimation(masonryAnimation) {
+                                                coordinator.toggleLike(noteID: note.id)
+                                            }
+                                        } label: {
+                                            Label(L10n.text(liked ? "feed.bookmark.remove" : "feed.bookmark"),
+                                                  systemImage: liked ? "heart.slash" : "heart")
+                                        }
+                                        Button { exportNotes([note]) } label: { Label(L10n.text("library.notes.share"), systemImage: "square.and.arrow.up") }
+                                        if let authorKey = note.authorKey {
+                                            Button {
+                                                remarkText = coordinator.remark(for: authorKey) ?? ""
+                                                authorToRemark = AuthorTarget(id: authorKey, name: note.author)
+                                            } label: {
+                                                Label(L10n.text("library.author.remark"), systemImage: "pencil")
+                                            }
+                                        }
+                                        Menu {
+                                            ForEach(coordinator.collections) { collection in
+                                                Button {
+                                                    let ids: Set<String> = [note.id]
+                                                    let inside = coordinator.collection(collection.id)?.noteIDs.contains(note.id) ?? false
+                                                    withAnimation(masonryAnimation) {
+                                                        coordinator.setMembership(ids, in: collection.id, included: !inside)
                                                     }
                                                 } label: {
-                                                    Label(L10n.text("library.collection.add"), systemImage: "folder.badge.plus")
-                                                }
-                                                if let collectionFilter,
-                                                   let collection = coordinator.collection(collectionFilter) {
-                                                    Button(role: .destructive) {
-                                                        coordinator.setMembership([note.id], in: collection.id, included: false)
-                                                    } label: {
-                                                        Label(L10n.text("library.collection.delete"), systemImage: "folder.badge.minus")
-                                                    }
-                                                }
-                                                if coordinator.note(forKey: note.id)?.archivePaths.isEmpty == false {
-                                                    Button {
-                                                        reauthorizeNote = note.id
-                                                        showsArchivePicker = true
-                                                    } label: {
-                                                        Label(L10n.text("library.archive.reauthorize"), systemImage: "folder.badge.gearshape")
-                                                    }
-                                                }
-                                                Button(role: .destructive) { confirmNoteDeletion([note.id]) } label: {
-                                                    Label(L10n.text("library.notes.delete"), systemImage: "trash")
+                                                    Label("\((coordinator.collection(collection.id)?.noteIDs.contains(note.id) ?? false) ? "✓ " : "")  \(collection.name)",
+                                                          systemImage: "folder")
                                                 }
                                             }
+                                            Button { newCollectionName = ""; showsNewCollection = true } label: {
+                                                Label(L10n.text("library.collection.new"), systemImage: "plus")
+                                            }
+                                        } label: {
+                                            Label(L10n.text("library.collection.add"), systemImage: "folder.badge.plus")
+                                        }
+                                        if let collectionFilter,
+                                           let collection = coordinator.collection(collectionFilter) {
+                                            Button(role: .destructive) {
+                                                withAnimation(masonryAnimation) {
+                                                    coordinator.setMembership([note.id], in: collection.id, included: false)
+                                                }
+                                            } label: {
+                                                Label(L10n.text("library.collection.delete"), systemImage: "folder.badge.minus")
+                                            }
+                                        }
+                                        if coordinator.note(forKey: note.id)?.archivePaths.isEmpty == false {
+                                            Button {
+                                                reauthorizeNote = note.id
+                                                showsArchivePicker = true
+                                            } label: {
+                                                Label(L10n.text("library.archive.reauthorize"), systemImage: "folder.badge.gearshape")
+                                            }
+                                        }
+                                        Button(role: .destructive) { confirmNoteDeletion([note.id]) } label: {
+                                            Label(L10n.text("library.notes.delete"), systemImage: "trash")
+                                        }
                                     }
-                                }
-                                .frame(width: width)
+                                    .transition(MasonryCardTransition(reduceMotion: reduceMotion))
                             }
                         }
                         .padding(.horizontal, 8)
                         .padding(.top, 4)
                         .padding(.bottom, 12)
+                        .onGeometryChange(for: Int.self) { proxy in
+                            let minY = proxy.frame(in: .named("feed-scroll")).minY
+                            let scrollOffset = max(0, -minY)
+                            return Int((scrollOffset / step).rounded(.down))
+                        } action: { newBucket in
+                            if scrollBucket != newBucket { scrollBucket = newBucket }
+                            if currentViewportHeight > 0, abs(lastViewportHeight - currentViewportHeight) > 1 {
+                                lastViewportHeight = currentViewportHeight
+                            }
+                        }
+
+                        if snapshot.visible.isEmpty {
+                            GlassEmptyState(
+                                title: search.isEmpty ? L10n.text(scope == 1 ? "feed.bookmarks.empty" : "library.empty")
+                                                      : L10n.text("feed.search.empty"),
+                                systemImage: !search.isEmpty ? "magnifyingglass" : (scope == 1 ? "heart" : "photo.on.rectangle.angled")
+                            )
+                            .padding(.top, model.authorized ? 64 : 24)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        }
                     }
+                    .animation(masonryAnimation, value: visibleOrderKey)
                 }
+                .coordinateSpace(name: "feed-scroll")
                 .accessibilityIdentifier("library-note-feed")
-                .scrollEdgeEffectHidden(true, for: .top)
+                .xhsScrollEdgeEffectHiddenTop()
                 .background {
                     ZStack {
                         GlassBackdrop(color: .coral, intensity: 0.75)
@@ -292,33 +348,53 @@ struct MediaLibraryView: View {
             }
             .navigationTitle(L10n.text("tab.library"))
             .toolbar(.hidden, for: .navigationBar)
-            .safeAreaBar(edge: .top, spacing: 0) {
-                feedHeader
+            .xhsSafeAreaBar(edge: .top, spacing: 0) {
+                feedHeaderBar(snapshot: snapshot, bindFocus: true)
                     .opacity(feedGeometry.concealingHeader ? 0 : 1)
                     .animation(nil, value: feedGeometry.concealingHeader)
             }
-            .safeAreaBar(edge: .bottom, spacing: 0) {
+            .xhsSafeAreaBar(edge: .bottom, spacing: 0) {
                 if isSelecting {
-                    selectionBar
+                    selectionBar(snapshot: snapshot)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
-            .animation(XHSDesign.animation(reduceMotion), value: isSelecting)
             .task(id: identifiers) { await model.load(legacyIdentifiers: identifiers) }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 Task { await model.load(legacyIdentifiers: identifiers) }
             }
-            .onChange(of: visibleIDs) { _, ids in selection.formIntersection(ids) }
+            .onChange(of: snapshot.visibleIDs) { _, ids in
+                selection.formIntersection(ids)
+                feedGeometry.pruneCards(keeping: ids)
+            }
             .background {
+                let currentOpened = snapshot.sortedNotes.first(where: { $0.id == openedNote?.id }) ?? openedNote
                 NoteHeroPresentation(item: $presentation.selection, card: true, source: feedGeometry, destination: readerGeometry,
-                                     preview: { $0.image },
-                                     foregroundHeader: { AnyView(feedHeaderBar(bindFocus: false)) },
-                                     contentRevision: AnyHashable(notes.first(where: { $0.id == openedNote?.id }) ?? openedNote)) { selected, close in
-                    if let openedNote, let note = notes.first(where: { $0.id == openedNote.id }) ?? Optional(openedNote) {
+                                     preview: { $0.id.hasPrefix("text:") ? nil : $0.image },
+                                     foregroundHeader: { AnyView(feedHeaderBar(snapshot: snapshot, bindFocus: false)) },
+                                     cardFooter: currentOpened.map { note in
+                                         {
+                                             AnyView(
+                                                 NoteFeedCardFooter(
+                                                     author: note.author,
+                                                     avatarURL: note.avatarURL,
+                                                     liked: coordinator.likedNotes.contains(note.id),
+                                                     isSelecting: isSelecting
+                                                 )
+                                             )
+                                         }
+                                     },
+                                     contentRevision: AnyHashable(currentOpened)) { selected, close in
+                    if let note = currentOpened {
                         NoteReaderView(note: note, initialImage: selected.image, coordinator: coordinator,
                                        namespace: previewTransition, heroGeometry: readerGeometry, onClose: close,
-                                       onDelete: delete, onCopy: coordinator.copyToClipboard,
-                                       onTopic: { topic in search = topic; showsSearch = true; scope = 0; filter = 0 })
+                                       onDelete: { ids in try await delete(ids, fromNoteID: note.id) },
+                                       onCopy: coordinator.copyToClipboard,
+                                       onTopic: { topic in
+                                           withAnimation(XHSDesign.animation(reduceMotion)) {
+                                               search = topic; showsSearch = true; scope = 0; filter = 0
+                                           }
+                                       })
                     }
                 }
             }
@@ -360,7 +436,6 @@ struct MediaLibraryView: View {
                 Button(L10n.text("library.notes.delete_keep_media"), role: .destructive) {
                     deleteSelectedNotes(deleteMedia: false)
                 }
-                .disabled(!notesToDelete.contains { coordinator.note(forKey: $0) != nil })
                 Button(L10n.text("library.notes.delete_with_media"), role: .destructive) {
                     deleteSelectedNotes(deleteMedia: true)
                 }
@@ -427,26 +502,27 @@ struct MediaLibraryView: View {
         }
     }
 
-    private var feedHeader: some View {
-        feedHeaderBar(bindFocus: true)
-    }
-
-    private func feedHeaderBar(bindFocus: Bool) -> some View {
+    private func feedHeaderBar(snapshot: LibrarySnapshot, bindFocus: Bool) -> some View {
         VStack(spacing: 4) {
             HStack(spacing: 10) {
                     if isSelecting {
-                        Button(L10n.text(visibleIDs.isSubset(of: selection) ? "library.deselect_all" : "library.select_all")) {
-                            if visibleIDs.isSubset(of: selection) { selection.subtract(visibleIDs) } else { selection.formUnion(visibleIDs) }
+                        Button {
+                            if snapshot.visibleIDs.isSubset(of: selection) { selection.subtract(snapshot.visibleIDs) } else { selection.formUnion(snapshot.visibleIDs) }
                             AppFeedback.play(.selection)
+                        } label: {
+                            Text(L10n.text(snapshot.visibleIDs.isSubset(of: selection) ? "library.deselect_all" : "library.select_all"))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 16)
+                                .frame(minHeight: 44)
+                                .contentShape(Capsule())
                         }
-                        .font(.subheadline.weight(.semibold))
-                        .padding(.horizontal, 16)
-                        .frame(minHeight: 44)
-                        .glassEffect(.regular.interactive(), in: Capsule())
+                        .buttonStyle(.plain)
+                        .xhsGlass(interactive: true, in: Capsule())
                         .accessibilityIdentifier("library-select-all")
-                        .disabled(visibleIDs.isEmpty)
+                        .disabled(snapshot.visibleIDs.isEmpty)
                     } else {
-                        feedMenu
+                        feedMenu(authors: snapshot.authors)
                     }
                     Spacer(minLength: 0)
                     if !isSelecting {
@@ -457,21 +533,31 @@ struct MediaLibraryView: View {
                         Spacer(minLength: 0)
                     }
                     if isSelecting {
-                        Button(L10n.text("common.done")) {
+                        Button {
                             withAnimation(XHSDesign.animation(reduceMotion)) { isSelecting = false; selection.removeAll() }
                             AppFeedback.play(.selection)
+                        } label: {
+                            Text(L10n.text("common.done"))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .frame(minHeight: 44)
+                                .contentShape(Capsule())
                         }
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .frame(minHeight: 44)
-                        .glassEffect(.regular.tint(.coral).interactive(), in: Capsule())
+                        .buttonStyle(.plain)
+                        .xhsGlass(tint: .coral, prominent: true, interactive: true, in: Capsule())
                         .accessibilityIdentifier("library-select-done")
                     } else {
                         Button {
                             AppFeedback.play(.navigation)
-                            withAnimation(XHSDesign.animation(reduceMotion)) { showsSearch.toggle() }
-                            if !showsSearch { search = ""; searchFocused = false } else { searchFocused = true }
+                            let next = !showsSearch
+                            withAnimation(XHSDesign.animation(reduceMotion)) { showsSearch = next }
+                            if !next {
+                                search = ""
+                                searchFocused = false
+                            } else {
+                                Task { @MainActor in searchFocused = true }
+                            }
                         } label: {
                             Image(systemName: showsSearch ? "xmark" : "magnifyingglass")
                                 .font(.system(size: 18, weight: .medium))
@@ -480,7 +566,7 @@ struct MediaLibraryView: View {
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
-                        .glassEffect(.regular.interactive(), in: Circle())
+                        .xhsGlass(interactive: true, in: Circle())
                         .accessibilityLabel(L10n.text("library.search"))
                         .accessibilityIdentifier("feed-search")
                     }
@@ -510,10 +596,11 @@ struct MediaLibraryView: View {
                 }
                 .padding(.horizontal, 14)
                 .frame(minHeight: 44)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .xhsGlass(interactive: true, in: Capsule())
                 .padding(.horizontal, 12)
                 .padding(.top, 4)
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .clipped()
+                .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
             }
 
             GlassChipBar(items: (0..<4).map { index in
@@ -524,12 +611,14 @@ struct MediaLibraryView: View {
             }, selection: $filter, horizontalPadding: 12)
 
             if authorFilter != nil || collectionFilter != nil {
-                activeFilterTokens
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                activeFilterTokens(authors: snapshot.authors)
+                    .clipped()
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
             }
             if busy { ProgressView().padding(4) }
         }
         .padding(.bottom, 8)
+        .modifier(OptionalNoteHeroFrame(enabled: bindFocus, geometry: feedGeometry, role: "header", id: "feed"))
         .background {
             Group {
                 if reduceTransparency {
@@ -560,7 +649,7 @@ struct MediaLibraryView: View {
     /// Author and collection filters live in the menu; once chosen they show
     /// here as removable tokens, so a narrowed feed never looks mysteriously
     /// empty.
-    private var activeFilterTokens: some View {
+    private func activeFilterTokens(authors: [(key: String, name: String, count: Int)]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 if let authorFilter {
@@ -597,11 +686,11 @@ struct MediaLibraryView: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular.tint(.coral.opacity(0.14)).interactive(), in: Capsule())
+        .xhsGlass(tint: .coral.opacity(0.14), prominent: false, interactive: true, in: Capsule())
         .accessibilityHint(L10n.text("feed.filter.clear"))
     }
 
-    private var feedMenu: some View {
+    private func feedMenu(authors: [(key: String, name: String, count: Int)]) -> some View {
         Menu {
             Button {
                 withAnimation(XHSDesign.animation(reduceMotion)) { isSelecting = true }
@@ -611,7 +700,7 @@ struct MediaLibraryView: View {
             }
             .accessibilityIdentifier("library-enter-selection")
             Divider()
-            Picker(L10n.text("library.sort"), selection: $preferences.sortOrder) {
+            Picker(L10n.text("library.sort"), selection: $preferences.sortOrder.animation(XHSDesign.animation(reduceMotion, .spring(response: 0.42, dampingFraction: 0.84)))) {
                 ForEach(NoteSortOrder.allCases) { order in
                     Text(L10n.text(order.localizationKey)).tag(order)
                 }
@@ -619,7 +708,9 @@ struct MediaLibraryView: View {
             Menu {
                 Button {
                     guard authorFilter != nil else { return }
-                    authorFilter = nil
+                    withAnimation(XHSDesign.animation(reduceMotion, .spring(response: 0.42, dampingFraction: 0.84))) {
+                        authorFilter = nil
+                    }
                     AppFeedback.play(.selection)
                 } label: {
                     Label(L10n.text("library.filter.all"), systemImage: authorFilter == nil ? "checkmark" : "")
@@ -627,7 +718,9 @@ struct MediaLibraryView: View {
                 ForEach(authors, id: \.key) { author in
                     Button {
                         guard authorFilter != author.key else { return }
-                        authorFilter = author.key
+                        withAnimation(XHSDesign.animation(reduceMotion, .spring(response: 0.42, dampingFraction: 0.84))) {
+                            authorFilter = author.key
+                        }
                         AppFeedback.play(.selection)
                     } label: {
                         Label("\(author.name) (\(author.count))",
@@ -640,7 +733,9 @@ struct MediaLibraryView: View {
             Menu {
                 Button {
                     guard collectionFilter != nil else { return }
-                    collectionFilter = nil
+                    withAnimation(XHSDesign.animation(reduceMotion, .spring(response: 0.42, dampingFraction: 0.84))) {
+                        collectionFilter = nil
+                    }
                     AppFeedback.play(.selection)
                 } label: {
                     Label(L10n.text("library.filter.all"), systemImage: collectionFilter == nil ? "checkmark" : "")
@@ -648,7 +743,9 @@ struct MediaLibraryView: View {
                 ForEach(coordinator.collections) { collection in
                     Button {
                         guard collectionFilter != collection.id else { return }
-                        collectionFilter = collection.id
+                        withAnimation(XHSDesign.animation(reduceMotion, .spring(response: 0.42, dampingFraction: 0.84))) {
+                            collectionFilter = collection.id
+                        }
                         AppFeedback.play(.selection)
                     } label: {
                         Label("\(collection.name) (\(collection.noteIDs.count))",
@@ -672,41 +769,47 @@ struct MediaLibraryView: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular, in: Circle())
+        .xhsGlass(in: Circle())
         .accessibilityLabel(L10n.text("library.select"))
         .accessibilityIdentifier("library-select")
     }
 
     /// Floating glass selection toolbar: the count on the left, actions grouped
     /// in one capsule on the right, both above the system tab bar.
-    private var selectionBar: some View {
+    private func selectionBar(snapshot: LibrarySnapshot) -> some View {
         HStack(spacing: 10) {
                 Text(L10n.format("library.notes.selection_count", selection.count))
                     .font(.subheadline.weight(.semibold))
                     .contentTransition(.numericText(value: Double(selection.count)))
                     .padding(.horizontal, 18)
                     .frame(minHeight: 50)
-                    .glassEffect(.regular, in: Capsule())
+                    .xhsGlass(in: Capsule())
                     .accessibilityIdentifier("library-selection-count")
                 Spacer(minLength: 0)
                 HStack(spacing: 2) {
                     Menu {
                         Button {
-                            coordinator.copyToClipboard(selectedLinks.joined(separator: "\n"))
-                            errorMessage = L10n.format("library.links.copied", selectedLinks.count)
+                            coordinator.copyToClipboard(snapshot.selectedLinks.joined(separator: "\n"))
+                            errorMessage = L10n.format("library.links.copied", snapshot.selectedLinks.count)
                         } label: {
-                            Label(L10n.format("library.links.copy_selected", selectedLinks.count),
+                            Label(L10n.format("library.links.copy_selected", snapshot.selectedLinks.count),
                                   systemImage: "link")
                         }
-                        .disabled(selectedLinks.isEmpty)
+                        .disabled(snapshot.selectedLinks.isEmpty)
                     } label: {
-                        Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Circle())
+                        Image(systemName: "ellipsis")
+                            .foregroundStyle(.primary)
+                            .frame(width: 46, height: 46)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(L10n.text("library.more"))
                     .accessibilityIdentifier("library-selection-more")
-                    Button { exportNotes(selectedNotes) } label: {
-                        Image(systemName: "square.and.arrow.up").frame(width: 46, height: 46).contentShape(Circle())
+                    Button { exportNotes(snapshot.selectedNotes) } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .foregroundStyle(.primary)
+                            .frame(width: 46, height: 46)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(L10n.text("library.notes.share"))
@@ -721,12 +824,13 @@ struct MediaLibraryView: View {
                 }
                 .font(.system(size: 18, weight: .medium))
                 .padding(.horizontal, 4)
-                .glassEffect(.regular, in: Capsule())
+                .xhsGlass(in: Capsule())
             }
         .disabled(selection.isEmpty || busy)
         .opacity(selection.isEmpty ? 0.85 : 1)
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
+        .xhsBarBackdrop(edge: .bottom)
     }
 
     /// A compact banner instead of a full-screen block: text-only and Files notes
@@ -739,20 +843,24 @@ struct MediaLibraryView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 4)
-            Button(L10n.text("library.permission.action")) {
+            Button {
                 let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
                 if status == .denied || status == .restricted {
                     UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
                 } else { Task { await model.load(legacyIdentifiers: identifiers, requestPermission: true) } }
+            } label: {
+                Text(L10n.text("library.permission.action"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 32)
+                    .contentShape(Capsule())
             }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .frame(minHeight: 32)
-            .glassEffect(.regular.tint(.coral).interactive(), in: Capsule())
+            .buttonStyle(.plain)
+            .xhsGlass(tint: .coral, prominent: true, interactive: true, in: Capsule())
         }
         .padding(12)
-        .glassEffect(.regular.tint(.orange.opacity(0.08)), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .xhsGlass(tint: .orange.opacity(0.08), prominent: false, interactive: false, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .padding(.horizontal, 12)
         .padding(.top, 8)
     }
@@ -786,6 +894,7 @@ struct MediaLibraryView: View {
         openedNote = note
         feedGeometry.selectedID = note.id
         feedGeometry.title = note.title
+        feedGeometry.coverRatio = note.coverRatio
         readerGeometry.selectedID = note.id
         guard let cover = note.cover else {
             openTextOnly(note)
@@ -796,22 +905,7 @@ struct MediaLibraryView: View {
 
     private func openTextOnly(_ note: LibraryNote) {
         AppFeedback.play(.navigation)
-        let size = CGSize(width: 600, height: 800)
-        let image = UIGraphicsImageRenderer(size: size).image { context in
-            UIColor.secondarySystemBackground.setFill()
-            context.fill(CGRect(origin: .zero, size: size))
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.lineBreakMode = .byTruncatingTail
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: UIFont.preferredFont(forTextStyle: .title3),
-                .foregroundColor: UIColor.label,
-                .paragraphStyle: paragraph
-            ]
-            let text = note.title.isEmpty ? note.body : note.title
-            (text as NSString).draw(in: CGRect(x: 32, y: 32, width: size.width - 64, height: size.height - 64),
-                                    withAttributes: attributes)
-        }
-        presentation.selection = MediaViewerSelection(id: "text:" + note.id, identifiers: [], image: image)
+        presentation.selection = MediaViewerSelection(id: "text:" + note.id, identifiers: [], image: UIImage())
     }
     private func toggle(_ note: LibraryNote) {
         if !selection.insert(note.id).inserted { selection.remove(note.id) }
@@ -826,7 +920,10 @@ struct MediaLibraryView: View {
 
     private func deleteSelectedNotes(deleteMedia: Bool) {
         let ids = notesToDelete
-        let standalone = notes.filter { ids.contains($0.id) && coordinator.note(forKey: $0.id) == nil }
+        let all = NoteLibrary.notes(stored: coordinator.notes,
+                                    media: model.assets.map(LibraryMedia.init),
+                                    hiddenMediaIDs: coordinator.hiddenMediaIDs)
+        let standalone = all.filter { ids.contains($0.id) && coordinator.note(forKey: $0.id) == nil }
         busy = true
         Task {
             defer { busy = false }
@@ -853,15 +950,37 @@ struct MediaLibraryView: View {
         }
     }
     private func confirmDelete(_ ids: Set<String>) { deletion = ids; showsDeletion = true; AppFeedback.play(.warning) }
-    private func delete(_ ids: Set<String>) async throws {
-        do { try await model.delete(ids) }
-        catch let failure as MediaDeletionFailure {
-            coordinator.removeMediaReferences(failure.deleted)
-            throw failure
+    private func delete(_ ids: Set<String>, fromNoteID: String? = nil) async throws {
+        do {
+            try await coordinator.deleteMedia(ids, fromNoteID: fromNoteID)
+        } catch {
+            await model.load(legacyIdentifiers: identifiers)
+            throw error
         }
-        // The note store is independent of tasks, so it must forget the assets
-        // explicitly or the feed would keep dead identifiers.
-        coordinator.removeMediaReferences(ids)
+        await model.load(legacyIdentifiers: identifiers)
+    }
+
+    private static func estimatedVerticalRanges(
+        for notes: [LibraryNote],
+        width: CGFloat,
+        columns: Int,
+        horizontalSpacing: CGFloat,
+        verticalSpacing: CGFloat
+    ) -> [String: ClosedRange<CGFloat>] {
+        let count = max(1, columns)
+        var columnHeights = Array(repeating: CGFloat.zero, count: count)
+        var ranges: [String: ClosedRange<CGFloat>] = [:]
+        ranges.reserveCapacity(notes.count)
+        let safeWidth = max(1, width)
+        for note in notes {
+            let column = columnHeights.indices.min(by: { columnHeights[$0] < columnHeights[$1] }) ?? 0
+            let top = columnHeights[column]
+            let estimatedHeight = safeWidth / note.coverRatio + (note.title.isEmpty ? 48 : 92)
+            let bottom = top + estimatedHeight
+            ranges[note.id] = top...bottom
+            columnHeights[column] = bottom + verticalSpacing
+        }
+        return ranges
     }
     private func export(_ ids: [String]) {
         busy = true; AppFeedback.play(.navigation)
@@ -875,6 +994,109 @@ struct MediaLibraryView: View {
     }
 }
 
+/// Single-container shortest-column-first masonry layout. Keeping every visible
+/// card in one `ForEach` lets SwiftUI preserve view identity (`note.id`) and
+/// smoothly spring-interpolate cross-column moves across Discover/Bookmarks,
+/// filters, and sort changes.
+private struct MasonryLayout: Layout {
+    var columns: Int
+    var horizontalSpacing: CGFloat = 8
+    var verticalSpacing: CGFloat = 10
+
+    struct Cache {
+        var width: CGFloat = -1
+        var columnCount: Int = 0
+        var frames: [CGRect] = []
+        var totalHeight: CGFloat = 0
+    }
+
+    func makeCache(subviews: Subviews) -> Cache { Cache() }
+
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        cache.width = -1
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
+        let width = max(0, proposal.width ?? 320)
+        computeLayout(width: width, subviews: subviews, cache: &cache)
+        return CGSize(width: width, height: cache.totalHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
+        computeLayout(width: bounds.width, subviews: subviews, cache: &cache)
+        for (index, subview) in subviews.enumerated() where index < cache.frames.count {
+            let frame = cache.frames[index]
+            subview.place(
+                at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: frame.width, height: frame.height)
+            )
+        }
+    }
+
+    private func computeLayout(width: CGFloat, subviews: Subviews, cache: inout Cache) {
+        let count = max(1, columns)
+        if cache.width == width, cache.columnCount == count, cache.frames.count == subviews.count {
+            return
+        }
+        cache.width = width
+        cache.columnCount = count
+        cache.frames.removeAll(keepingCapacity: true)
+        guard !subviews.isEmpty, width > 0 else {
+            cache.totalHeight = 0
+            return
+        }
+        let columnWidth = max(1, (width - CGFloat(count - 1) * horizontalSpacing) / CGFloat(count))
+        var columnHeights = Array(repeating: CGFloat.zero, count: count)
+        let itemProposal = ProposedViewSize(width: columnWidth, height: nil)
+        for subview in subviews {
+            let measured = subview.sizeThatFits(itemProposal)
+            let column = columnHeights.indices.min(by: { columnHeights[$0] < columnHeights[$1] }) ?? 0
+            let x = CGFloat(column) * (columnWidth + horizontalSpacing)
+            let y = columnHeights[column]
+            cache.frames.append(CGRect(x: x, y: y, width: columnWidth, height: measured.height))
+            columnHeights[column] = y + measured.height + verticalSpacing
+        }
+        cache.totalHeight = max(0, (columnHeights.max() ?? 0) - verticalSpacing)
+    }
+}
+
+/// Asymmetric masonry card transition:
+/// - Entering cards glide smoothly upward from below with subtle scale & fade.
+/// - Surviving/repositioning cards stay on top (`zIndex(2)`) so cross-column
+///   moves never pass underneath departing cards.
+/// - Exiting cards scale down gently (`0.92`) and fade out behind (`zIndex(0)`).
+private struct MasonryCardTransition: Transition {
+    let reduceMotion: Bool
+
+    func body(content: Content, phase: TransitionPhase) -> some View {
+        let scale: CGFloat = reduceMotion ? 1 : (phase == .willAppear ? 0.93 : (phase == .didDisappear ? 0.92 : 1))
+        let yOffset: CGFloat = (!reduceMotion && phase == .willAppear) ? 84 : 0
+        let zOrder: Double = phase == .identity ? 2 : (phase == .willAppear ? 1 : 0)
+        return content
+            .opacity(phase.isIdentity ? 1 : 0)
+            .scaleEffect(scale)
+            .offset(y: yOffset)
+            .zIndex(zOrder)
+    }
+}
+
+private struct OptionalNoteHeroFrame: ViewModifier {
+    let enabled: Bool
+    let geometry: NoteHeroGeometry
+    let role: String
+    let id: String
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.modifier(NoteHeroFrame(geometry: geometry, role: role, id: id))
+        } else {
+            content
+        }
+    }
+}
+
 private extension View {
     func mediaBadge() -> some View {
         font(.caption2.weight(.semibold))
@@ -882,6 +1104,27 @@ private extension View {
             .foregroundStyle(.white)
             .background(.black.opacity(0.55), in: Capsule())
             .padding(6)
+    }
+
+    @ViewBuilder
+    func xhsScrollEdgeEffectHiddenTop() -> some View {
+        if #available(iOS 26.0, *) {
+            self.scrollEdgeEffectHidden(true, for: .top)
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder
+    func xhsViewerGlassControl(tint: Color) -> some View {
+        if #available(iOS 26.0, *) {
+            self.buttonStyle(.glass).tint(tint)
+        } else {
+            self.buttonStyle(.plain)
+                .foregroundStyle(tint)
+                .contentShape(Circle())
+                .xhsGlass(interactive: true, darkOverlay: true, in: Circle())
+        }
     }
 }
 
@@ -922,6 +1165,7 @@ struct MediaViewer: View {
     private let initialImage: UIImage
     private let transition: Namespace.ID
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(identifiers: [String], initialIdentifier: String, initialImage: UIImage,
          transition: Namespace.ID, onDelete: ((Set<String>) async throws -> Void)? = nil,
@@ -942,6 +1186,13 @@ struct MediaViewer: View {
         return PHAsset.fetchAssets(withLocalIdentifiers: [selected], options: nil).firstObject
     }
 
+    private var isCurrentVideo: Bool {
+        if let asset { return asset.mediaType == .video }
+        guard selected.hasPrefix("file:") else { return false }
+        let paths = selected.dropFirst("file:".count).split(separator: "\n").map(String.init)
+        return !paths.isEmpty && paths.allSatisfy { MediaFileValidator.isVideoFile(URL(fileURLWithPath: $0)) }
+    }
+
     private var pageTitle: String { "\((identifiers.firstIndex(of: selected) ?? 0) + 1) / \(identifiers.count)" }
 
     private var pages: some View {
@@ -953,7 +1204,7 @@ struct MediaViewer: View {
                                 heroGeometry: heroGeometry).tag(id)
             }
         }
-        .tabViewStyle(.page(indexDisplayMode: identifiers.count > 1 ? .automatic : .never))
+        .tabViewStyle(.page(indexDisplayMode: .never))
     }
 
     var body: some View {
@@ -977,43 +1228,56 @@ struct MediaViewer: View {
             shareDirectory = nil
         }) { MediaShareSheet(urls: $0.urls) }
         .environment(\.colorScheme, .dark)
+        .preferredColorScheme(.dark)
         .modifier(OptionalSystemMediaZoom(enabled: heroGeometry == nil, id: selected, namespace: transition))
     }
 
     private var floatingViewer: some View {
-        pages
+        let video = isCurrentVideo
+        return pages
             .ignoresSafeArea()
             .overlay(alignment: .top) {
-                GlassEffectContainer(spacing: 12) {
-                    HStack {
+                XHSGlassContainer(spacing: 12) {
+                    HStack(spacing: 8) {
                         closeControl
-                        Spacer()
+                        Spacer(minLength: 8)
                         Text(pageTitle)
                             .font(.system(size: 13, weight: .semibold).monospacedDigit())
                             .contentTransition(.numericText())
                             .foregroundStyle(.white)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .glassEffect(.regular.tint(.black.opacity(0.28)), in: Capsule())
+                            .xhsGlass(tint: .black.opacity(0.28), prominent: false, interactive: false, darkOverlay: true, in: Capsule())
                             .accessibilityIdentifier("viewer-page-count")
-                        Spacer()
-                        Color.clear.frame(width: 48, height: 48)
+                        Spacer(minLength: 8)
+                        if video {
+                            HStack(spacing: 8) {
+                                if busy { ProgressView().tint(.white) }
+                                shareControl
+                                if onDelete != nil { deleteControl }
+                            }
+                        } else {
+                            Color.clear.frame(width: 48, height: 48)
+                        }
                     }
                 }
                 .padding(.horizontal, 16).padding(.top, 12)
-                .animation(.snappy, value: selected)
+                .animation(XHSDesign.animation(reduceMotion, XHSDesign.snappy), value: selected)
             }
             .overlay(alignment: .bottom) {
-                GlassEffectContainer(spacing: 12) {
-                    HStack {
-                        shareControl
-                        Spacer()
-                        if asset?.mediaType != .video { zoomControl; Spacer() }
-                        if busy { ProgressView().tint(.white) }
-                        if onDelete != nil { deleteControl }
+                if !video {
+                    XHSGlassContainer(spacing: 12) {
+                        HStack {
+                            shareControl
+                            Spacer()
+                            zoomControl
+                            Spacer()
+                            if busy { ProgressView().tint(.white) }
+                            if onDelete != nil { deleteControl }
+                        }
                     }
+                    .padding(.horizontal, 16).padding(.bottom, 12)
                 }
-                .padding(.horizontal, 16).padding(.bottom, 12)
             }
             .background(.clear)
     }
@@ -1021,43 +1285,94 @@ struct MediaViewer: View {
     private var closeControl: some View {
         Button { AppFeedback.play(.navigation); close() } label: {
             Image(systemName: "xmark").font(.system(size: 19)).frame(width: 48, height: 48)
-        }.buttonStyle(.glass).tint(.white).accessibilityLabel(L10n.text("common.done")).accessibilityIdentifier("viewer-close")
+        }.xhsViewerGlassControl(tint: .white).accessibilityLabel(L10n.text("common.done")).accessibilityIdentifier("viewer-close")
     }
     private var shareControl: some View {
         Button { export() } label: {
             Image(systemName: "square.and.arrow.up").font(.system(size: 21)).frame(width: 48, height: 48)
-        }.buttonStyle(.glass).tint(.white).accessibilityLabel(L10n.text("library.share")).accessibilityIdentifier("viewer-share")
+        }.xhsViewerGlassControl(tint: .white).accessibilityLabel(L10n.text("library.share")).accessibilityIdentifier("viewer-share")
     }
     private var zoomControl: some View {
         Button { zoomTrigger += 1 } label: {
             Image(systemName: "plus.magnifyingglass").font(.system(size: 21)).frame(width: 48, height: 48)
-        }.buttonStyle(.glass).tint(.white).accessibilityLabel(L10n.text("viewer.zoom")).accessibilityIdentifier("viewer-zoom")
+        }.xhsViewerGlassControl(tint: .white).accessibilityLabel(L10n.text("viewer.zoom")).accessibilityIdentifier("viewer-zoom")
     }
     private var deleteControl: some View {
         Button(role: .destructive) { AppFeedback.play(.warning); showsDeletion = true } label: {
             Image(systemName: "trash").font(.system(size: 21)).frame(width: 48, height: 48)
-        }.buttonStyle(.glass).tint(.red).accessibilityLabel(L10n.text("common.delete")).accessibilityIdentifier("viewer-delete")
+        }.xhsViewerGlassControl(tint: .red).accessibilityLabel(L10n.text("common.delete")).accessibilityIdentifier("viewer-delete")
+    }
+
+    @ViewBuilder
+    private var systemViewerBottomItems: some View {
+        shareControl
+        Spacer()
+        if !isCurrentVideo { zoomControl; Spacer() }
+        if busy { ProgressView().tint(.white) }
+        if onDelete != nil { deleteControl }
+    }
+
+    @ViewBuilder
+    private func systemViewerToolbar<Content: View>(for content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.toolbar {
+                ToolbarItem(placement: .topBarLeading) { closeControl }
+                    .sharedBackgroundVisibility(.hidden)
+                ToolbarItemGroup(placement: .bottomBar) {
+                    systemViewerBottomItems
+                }
+                .sharedBackgroundVisibility(.hidden)
+            }
+        } else {
+            content.toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { AppFeedback.play(.navigation); close() } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .tint(.white)
+                    .accessibilityLabel(L10n.text("common.done"))
+                    .accessibilityIdentifier("viewer-close")
+                }
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button { export() } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .tint(.white)
+                    .accessibilityLabel(L10n.text("library.share"))
+                    .accessibilityIdentifier("viewer-share")
+                    Spacer()
+                    if !isCurrentVideo {
+                        Button { zoomTrigger += 1 } label: {
+                            Image(systemName: "plus.magnifyingglass")
+                        }
+                        .tint(.white)
+                        .accessibilityLabel(L10n.text("viewer.zoom"))
+                        .accessibilityIdentifier("viewer-zoom")
+                        Spacer()
+                    }
+                    if busy { ProgressView().tint(.white) }
+                    if onDelete != nil {
+                        Button(role: .destructive) { AppFeedback.play(.warning); showsDeletion = true } label: {
+                            Image(systemName: "trash")
+                        }
+                        .tint(.red)
+                        .accessibilityLabel(L10n.text("common.delete"))
+                        .accessibilityIdentifier("viewer-delete")
+                    }
+                }
+            }
+        }
     }
 
     private var systemViewer: some View {
         NavigationStack {
-            pages.background(.black).ignoresSafeArea(edges: .bottom)
-                .navigationTitle(pageTitle).navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { closeControl }
-                        .sharedBackgroundVisibility(.hidden)
-                    ToolbarItemGroup(placement: .bottomBar) {
-                        shareControl
-                        Spacer()
-                        if asset?.mediaType != .video { zoomControl; Spacer() }
-                        if busy { ProgressView() }
-                        if onDelete != nil { deleteControl }
-                    }
-                    .sharedBackgroundVisibility(.hidden)
-                }
-                .toolbarColorScheme(.dark, for: .navigationBar)
-                .toolbarBackground(.black, for: .navigationBar, .bottomBar)
-                .toolbarBackground(.visible, for: .navigationBar, .bottomBar)
+            systemViewerToolbar(for:
+                pages.background(.black).ignoresSafeArea(edges: .bottom)
+                    .navigationTitle(pageTitle).navigationBarTitleDisplayMode(.inline)
+            )
+            .toolbarColorScheme(.dark, for: .navigationBar, .bottomBar)
+            .toolbarBackground(.black, for: .navigationBar, .bottomBar)
+            .toolbarBackground(.visible, for: .navigationBar, .bottomBar)
         }.background(.black)
     }
 
@@ -1226,8 +1541,9 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
             viewportSize = view.bounds.size
             scroll.setZoomScale(1, animated: false)
             scroll.frame = view.bounds
-            let scale = min(scroll.bounds.width / pixelSize.width, scroll.bounds.height / pixelSize.height)
-            canvas.frame = CGRect(origin: .zero, size: CGSize(width: pixelSize.width * scale, height: pixelSize.height * scale))
+            let w = max(1, pixelSize.width), h = max(1, pixelSize.height)
+            let scale = min(scroll.bounds.width / w, scroll.bounds.height / h)
+            canvas.frame = CGRect(origin: .zero, size: CGSize(width: w * scale, height: h * scale))
             imageView.frame = canvas.bounds
             liveView.frame = canvas.bounds
             fileLiveLayer?.frame = canvas.bounds
@@ -1235,14 +1551,52 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
             centerCanvas()
         }
         playerController.view.frame = view.bounds
-        if scroll.superview == nil { imageView.frame = view.bounds }
+        if scroll.superview == nil {
+            let w = max(1, pixelSize.width), h = max(1, pixelSize.height)
+            let scale = min(view.bounds.width / w, view.bounds.height / h)
+            let fitted = CGSize(width: w * scale, height: h * scale)
+            imageView.frame = CGRect(
+                x: (view.bounds.width - fitted.width) / 2,
+                y: (view.bounds.height - fitted.height) / 2,
+                width: fitted.width, height: fitted.height
+            )
+        }
         message.frame = view.bounds.insetBy(dx: 30, dy: 50)
         spinner.center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if scroll.superview != nil, !view.bounds.isEmpty { centerCanvas() }
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        if scroll.superview != nil, !view.bounds.isEmpty { centerCanvas() }
+    }
+
+    private func registerHeroViews() {
+        heroGeometry?.register(imageView, role: "image", id: identifier)
+        if playerController.viewIfLoaded?.superview != nil {
+            heroGeometry?.register(playerController.view, role: "player", id: identifier)
+        }
+        if liveView.superview != nil {
+            heroGeometry?.register(liveView, role: "live", id: identifier)
+        }
+        if active, let cardID {
+            cardGeometry?.register(imageView, role: "image", id: cardID)
+            if playerController.viewIfLoaded?.superview != nil {
+                cardGeometry?.register(playerController.view, role: "player", id: cardID)
+            }
+            if liveView.superview != nil {
+                cardGeometry?.register(liveView, role: "live", id: cardID)
+            }
+        }
+    }
+
     func setActive(_ value: Bool) {
         active = value
-        if value, let cardID { cardGeometry?.register(imageView, role: "image", id: cardID) }
+        if value { registerHeroViews() }
         if !value { playerController.player?.pause(); stopLivePlayback() }
     }
 
@@ -1319,9 +1673,23 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
     /// Files images share the Photos zoom canvas. Paired files stay still until
     /// held; a standalone video uses the standard player controls.
     private func configureFileMedia(_ identifier: String) {
+        let prepared = MediaPreviewImages.shared.image(for: identifier) ?? initialImage
+        if let prepared, prepared.size.width > 0, prepared.size.height > 0 {
+            // Mount the prepared still synchronously so the hero transition
+            // reads the exact destination frame on frame 0 instead of falling
+            // back to a centered screen box.
+            pixelSize = CGSize(width: max(1, prepared.size.width), height: max(1, prepared.size.height))
+            imageView.contentMode = .scaleAspectFit
+            imageView.preferredImageDynamicRange = .high
+            imageView.image = prepared
+            configureZoom()
+            canvas.addSubview(imageView)
+            registerHeroViews()
+            spinner.stopAnimating()
+            view.setNeedsLayout()
+        }
         fileLoad = Task { [weak self] in
             do {
-                let prepared = MediaPreviewImages.shared.image(for: identifier) ?? self?.initialImage
                 let lease = try await ArchiveMediaLoader.shared.lease(identifier: identifier)
                 let image: UIImage
                 if let prepared { image = prepared }
@@ -1329,22 +1697,30 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
                 guard let self, !self.stopped, !Task.isCancelled else { return }
                 self.fileLease = lease
                 guard !lease.urls.isEmpty else { self.fail(); return }
+                self.pixelSize = CGSize(width: max(1, image.size.width), height: max(1, image.size.height))
                 if lease.urls.allSatisfy({ MediaFileValidator.isVideoFile($0) }), let video = lease.urls.first {
+                    if self.scroll.superview != nil {
+                        self.imageView.removeFromSuperview()
+                        self.scroll.removeFromSuperview()
+                    }
                     self.imageView.image = image
                     self.imageView.contentMode = .scaleAspectFit
                     self.view.insertSubview(self.imageView, at: 0)
                     self.playFileVideo(video)
+                    self.registerHeroViews()
+                    self.view.setNeedsLayout()
                     return
                 }
-                self.pixelSize = image.size
                 self.imageView.contentMode = .scaleAspectFit
                 self.imageView.preferredImageDynamicRange = .high
                 self.imageView.image = image
                 MediaPreviewImages.shared.insert(image, for: identifier)
-                self.heroGeometry?.register(self.imageView, role: "image", id: identifier)
-                if self.active, let cardID = self.cardID { self.cardGeometry?.register(self.imageView, role: "image", id: cardID) }
-                self.configureZoom()
-                self.canvas.addSubview(self.imageView)
+                if self.scroll.superview == nil {
+                    self.configureZoom()
+                    self.canvas.addSubview(self.imageView)
+                }
+                self.viewportSize = .zero
+                self.registerHeroViews()
                 if let motion = lease.urls.first(where: { MediaFileValidator.isVideoFile($0) }) {
                     self.liveView.isMuted = true
                     let player = AVPlayer(url: motion)
@@ -1375,6 +1751,7 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
         addChild(playerController)
         view.insertSubview(playerController.view, at: 0)
         playerController.didMove(toParent: self)
+        registerHeroViews()
         view.bringSubviewToFront(imageView)
         view.bringSubviewToFront(spinner)
         videoReady = playerController.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] controller, _ in
@@ -1392,6 +1769,7 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
         addChild(playerController)
         view.insertSubview(playerController.view, at: 0)
         playerController.didMove(toParent: self)
+        registerHeroViews()
         // Keep the poster above the player until its first video frame exists.
         view.bringSubviewToFront(imageView)
         view.bringSubviewToFront(spinner)
@@ -1422,6 +1800,7 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
         liveView.delegate = self
         liveView.isHidden = true
         canvas.addSubview(liveView)
+        registerHeroViews()
         // Keep the prepared full-resolution still visible until playback starts.
         // The hidden Live Photo view cannot receive touches, so the zoom canvas
         // owns the long press and reveals it through its playback delegate.
@@ -1446,24 +1825,70 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
         configureLiveControls()
     }
 
+    private final class LiveHintPillLabel: UILabel {
+        private let insets = UIEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
+
+        override func drawText(in rect: CGRect) {
+            super.drawText(in: rect.inset(by: insets))
+        }
+
+        override var intrinsicContentSize: CGSize {
+            let size = super.intrinsicContentSize
+            return CGSize(width: size.width + insets.left + insets.right,
+                          height: size.height + insets.top + insets.bottom)
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            layer.cornerRadius = bounds.height / 2
+        }
+    }
+
     private func configureLiveControls() {
         let hold = UILongPressGestureRecognizer(target: self, action: #selector(playLivePhoto(_:)))
         hold.minimumPressDuration = 0.35
         scroll.addGestureRecognizer(hold)
-        let hint = UILabel()
+        let isFloatingViewer = heroGeometry != nil && backgroundColor == .clear
+        let isReaderCarousel = !isFloatingViewer && backgroundColor != .black
+        let hint = LiveHintPillLabel()
         hint.text = L10n.text("viewer.live.hint")
         hint.accessibilityIdentifier = "media-live-hint"
-        hint.textColor = controlColor
+        hint.textColor = .white
+        hint.backgroundColor = UIColor.black.withAlphaComponent(0.56)
+        hint.clipsToBounds = true
+        hint.layer.cornerCurve = .continuous
+        hint.layer.borderWidth = 0.5
+        hint.layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
         hint.font = .preferredFont(forTextStyle: .caption1)
         hint.adjustsFontForContentSizeCategory = true
+        hint.lineBreakMode = .byTruncatingTail
         hint.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(hint)
-        NSLayoutConstraint.activate([
-            hint.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            hint.centerXAnchor.constraint(equalTo: view.centerXAnchor)
-        ])
+        if isReaderCarousel {
+            NSLayoutConstraint.activate([
+                hint.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+                hint.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+                hint.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -68)
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                hint.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
+                                          constant: isFloatingViewer ? 68 : 12),
+                hint.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                hint.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+                hint.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16)
+            ])
+        }
         let sound = UIButton(type: .system)
+        let symbolConfig = UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        sound.setPreferredSymbolConfiguration(symbolConfig, forImageIn: .normal)
         sound.setImage(UIImage(systemName: "speaker.slash.fill"), for: .normal)
+        sound.tintColor = .white
+        sound.backgroundColor = UIColor.black.withAlphaComponent(0.56)
+        sound.layer.cornerRadius = 18
+        sound.layer.cornerCurve = .continuous
+        sound.layer.borderWidth = 0.5
+        sound.layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
         sound.accessibilityLabel = L10n.text("viewer.live.sound")
         sound.accessibilityIdentifier = "media-live-sound"
         sound.accessibilityValue = L10n.text("viewer.live.muted")
@@ -1477,10 +1902,12 @@ final class PhotosMediaController: UIViewController, UIScrollViewDelegate, PHLiv
         }, for: .touchUpInside)
         sound.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(sound)
+        let soundTrailing: CGFloat = isFloatingViewer ? -22 : -16
+        let soundBottom: CGFloat = isFloatingViewer ? -76 : (isReaderCarousel ? -64 : -68)
         NSLayoutConstraint.activate([
-            sound.widthAnchor.constraint(equalToConstant: 48), sound.heightAnchor.constraint(equalToConstant: 48),
-            sound.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            sound.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -32)
+            sound.widthAnchor.constraint(equalToConstant: 36), sound.heightAnchor.constraint(equalToConstant: 36),
+            sound.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: soundTrailing),
+            sound.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: soundBottom)
         ])
     }
 

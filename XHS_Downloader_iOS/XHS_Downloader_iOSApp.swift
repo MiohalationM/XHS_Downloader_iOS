@@ -25,7 +25,7 @@ struct XHS_Downloader_iOSApp: App {
                 var task = DownloadTaskRecord(
                     sourceText: "UI layout fixture",
                     normalizedURL: "https://www.xiaohongshu.com/explore/layout-fixture-\(index)",
-                    title: index == 1 ? "这张实况怎么火的" : "布局测试笔记 \(index)",
+                    title: index == 1 ? "DeepSeek V4.1 Flash：更强、更快、更普惠" : (index == 2 ? "DeepSeek 寻找闪亮发光的你" : "布局测试笔记 \(index)"),
                     status: .completed
                 )
                 task.id = UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index))!
@@ -46,7 +46,7 @@ struct XHS_Downloader_iOSApp: App {
                     task.savedCount = task.mediaAssets.count
                     task.progress = 1
                     if ProcessInfo.processInfo.arguments.contains("-ui-test-note-feed") {
-                        let titles = ["这张实况怎么火的", "把普通的日子过成喜欢的样子", "周末随手拍，也太有氛围了", "今天的快乐是自己给的", "记录生活里的小美好", "一些值得收藏的瞬间"]
+                        let titles = ["DeepSeek V4.1 Flash：更强、更快、更普惠", "DeepSeek 寻找闪亮发光的你", "原生多模态视觉理解能力解析", "离线实况与原件归档示例", "双列瀑布流交互与动效验证", "一些值得收藏的技术笔记"]
                         task.title = titles[(index - 1) % titles.count]
                         task.noteText = "最近最喜欢的一张照片，记录一下这个可爱的瞬间。\n\n光线刚刚好，普通的日子也有值得记住的风景。慢慢生活，认真感受。\n\n#生活记录[话题]# #随手拍[话题]#"
                         if ProcessInfo.processInfo.arguments.contains("-ui-test-long-note-body") {
@@ -90,6 +90,9 @@ struct XHS_Downloader_iOSApp: App {
             ContentView(coordinator: coordinator, settings: settings)
                 // "Follow system" leaves the value nil so the system choice wins.
                 .preferredColorScheme(colorScheme)
+                .task {
+                    await WebSession.shared.synchronize()
+                }
         }
     }
 

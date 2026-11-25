@@ -184,17 +184,23 @@ enum NoteLibrary {
             return notes.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
         case .publishedNewest:
             // Old notes only have the displayed day; new notes retain the exact
-            // instant. Resolve each key once, outside the sorting comparator.
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.calendar = Calendar(identifier: .gregorian)
-            formatter.dateFormat = "yyyy-MM-dd"
-            formatter.isLenient = false
-            return notes.map { note in
-                var day = note.publishTime ?? ""
-                if day.count == 8 { day = "20" + day }
-                let legacy = formatter.date(from: day)
-                return (note: note, published: note.publishedAt ?? legacy ?? note.date)
+            // instant. Instantiate the formatter lazily only if a legacy note needs it.
+            var formatter: DateFormatter?
+            return notes.map { note -> (note: LibraryNote, published: Date) in
+                if let published = note.publishedAt { return (note, published) }
+                if var day = note.publishTime, !day.isEmpty {
+                    if day.count == 8 { day = "20" + day }
+                    if formatter == nil {
+                        let f = DateFormatter()
+                        f.locale = Locale(identifier: "en_US_POSIX")
+                        f.calendar = Calendar(identifier: .gregorian)
+                        f.dateFormat = "yyyy-MM-dd"
+                        f.isLenient = false
+                        formatter = f
+                    }
+                    if let legacy = formatter?.date(from: day) { return (note, legacy) }
+                }
+                return (note, note.date)
             }.sorted { lhs, rhs in
                 if lhs.published != rhs.published { return lhs.published > rhs.published }
                 if lhs.note.date != rhs.note.date { return lhs.note.date > rhs.note.date }

@@ -20,8 +20,8 @@ enum ArchiveError: LocalizedError {
 /// The bookmark lives in the task policy snapshot, so an archived task keeps
 /// writing to the folder it was created with even after the setting changes.
 enum ArchiveDirectory {
-    static func makeBookmark(for url: URL) throws -> Data {
-        let scoped = url.startAccessingSecurityScopedResource()
+    static func makeBookmark(for url: URL, acquireScope: Bool = true) throws -> Data {
+        let scoped = acquireScope ? url.startAccessingSecurityScopedResource() : false
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         return try url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
     }
@@ -29,8 +29,9 @@ enum ArchiveDirectory {
     static func resolve(_ data: Data?) -> URL? {
         guard let data else { return nil }
         var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale),
-              !stale else { return nil }
+        guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else {
+            return nil
+        }
         return url
     }
 
@@ -39,13 +40,20 @@ enum ArchiveDirectory {
         return url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
     }
 
-    /// A bookmark that no longer resolves is reported as unavailable so the
-    /// settings screen can offer a re-authorization action instead of silently
-    /// writing nowhere.
+    /// A bookmark that no longer resolves or whose directory has been removed
+    /// is reported as unavailable so settings can offer re-authorization.
     static func isUsable(_ data: Data?) -> Bool {
-        guard data != nil else { return false }
-        return resolve(data) != nil
+        guard let url = resolve(data) else { return false }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
+}
+
+struct CaptionArchiveResult: Sendable {
+    var written: [String] = []
+    var reused: [String] = []
 }
 
 struct ArchiveResult: Sendable {
@@ -142,11 +150,18 @@ actor FileArchiver {
             }
             let ext = entry.file.pathExtension
             let expected = (try? entry.file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)
-            // Only pay for a digest when a skip decision is actually possible.
-            let expectedDigest = policy.skipExisting ? Self.digest(ofFile: entry.file) : nil
+            // Compute the source digest lazily only if an existing candidate
+            // file collides in name and byte size.
+            var cachedDigest: String?
+            let digestProvider: () -> String? = {
+                if let cachedDigest { return cachedDigest }
+                let value = Self.digest(ofFile: entry.file)
+                cachedDigest = value
+                return value
+            }
             let resolved = uniqueName(base: entry.baseName, ext: ext, in: directory.url,
                                       policy: policy, expectedByteCount: expected,
-                                      expectedDigest: expectedDigest)
+                                      expectedDigestProvider: policy.skipExisting ? digestProvider : nil)
             let target = directory.url.appendingPathComponent(resolved.name)
             if resolved.skipped {
                 result.skipped.append(entry.key)
@@ -155,8 +170,14 @@ actor FileArchiver {
                 continue
             }
             do {
-                if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
-                try FileManager.default.copyItem(at: entry.file, to: target)
+                let staged = directory.url.appendingPathComponent(".xhs-tmp-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: staged) }
+                try FileManager.default.copyItem(at: entry.file, to: staged)
+                if FileManager.default.fileExists(atPath: target.path) {
+                    _ = try FileManager.default.replaceItemAt(target, withItemAt: staged)
+                } else {
+                    try FileManager.default.moveItem(at: staged, to: target)
+                }
                 result.files.append(target.path)
                 result.paths[entry.key] = target.path
             } catch {
@@ -169,26 +190,62 @@ actor FileArchiver {
     }
 
     /// Caption files always land next to the media so a batch export stays a
-    /// single self-contained folder.
-    func writeCaptions(note: ResolvedNote, in directory: ResolvedDirectory, policy: DownloadPolicy) throws -> [String] {
-        guard policy.captionFormat != .none else { return [] }
-        var written: [String] = []
-        let base = uniqueName(base: Self.noteComponent(note), ext: "", in: directory.url, policy: policy).name
-        do {
-            if policy.captionFormat == .txt || policy.captionFormat == .both {
-                let url = directory.url.appendingPathComponent(base + ".txt")
-                try captionText(note, markdown: false).write(to: url, atomically: true, encoding: .utf8)
-                written.append(url.path)
+    /// single self-contained folder. Records files reused via `skipExisting`
+    /// separately so note deletion never unlinks pre-existing user files.
+    func archiveCaptions(note: ResolvedNote, in directory: ResolvedDirectory, policy: DownloadPolicy) throws -> CaptionArchiveResult {
+        guard policy.captionFormat != .none else { return CaptionArchiveResult() }
+        var result = CaptionArchiveResult()
+        let extensions: [(ext: String, markdown: Bool)] = {
+            switch policy.captionFormat {
+            case .none: return []
+            case .txt: return [("txt", false)]
+            case .markdown: return [("md", true)]
+            case .both: return [("txt", false), ("md", true)]
             }
-            if policy.captionFormat == .markdown || policy.captionFormat == .both {
-                let url = directory.url.appendingPathComponent(base + ".md")
-                try captionText(note, markdown: true).write(to: url, atomically: true, encoding: .utf8)
-                written.append(url.path)
+        }()
+        let sanitized = Self.directoryComponent(Self.noteComponent(note), fallback: note.noteID)
+        var stem = sanitized
+        var counter = 2
+        if !policy.skipExisting {
+            while extensions.contains(where: {
+                FileManager.default.fileExists(atPath: directory.url.appendingPathComponent(stem + "." + $0.ext).path)
+            }) {
+                stem = sanitized + "_" + String(counter)
+                counter += 1
+            }
+        }
+        do {
+            for item in extensions {
+                let url = directory.url.appendingPathComponent(stem + "." + item.ext)
+                let content = captionText(note, markdown: item.markdown)
+                if policy.skipExisting, FileManager.default.fileExists(atPath: url.path) {
+                    if (try? String(contentsOf: url, encoding: .utf8)) == content {
+                        result.written.append(url.path)
+                        result.reused.append(url.path)
+                        continue
+                    }
+                    var alt = sanitized + "_2"
+                    var c = 2
+                    while FileManager.default.fileExists(atPath: directory.url.appendingPathComponent(alt + "." + item.ext).path) {
+                        c += 1
+                        alt = sanitized + "_" + String(c)
+                    }
+                    let altURL = directory.url.appendingPathComponent(alt + "." + item.ext)
+                    try content.write(to: altURL, atomically: true, encoding: .utf8)
+                    result.written.append(altURL.path)
+                } else {
+                    try content.write(to: url, atomically: true, encoding: .utf8)
+                    result.written.append(url.path)
+                }
             }
         } catch {
             throw ArchiveError.writeFailed(error.localizedDescription)
         }
-        return written
+        return result
+    }
+
+    func writeCaptions(note: ResolvedNote, in directory: ResolvedDirectory, policy: DownloadPolicy) throws -> [String] {
+        try archiveCaptions(note: note, in: directory, policy: policy).written
     }
 
     func captionText(_ note: ResolvedNote, markdown: Bool) -> String {
@@ -222,7 +279,7 @@ actor FileArchiver {
     private func uniqueName(base: String, ext: String, in directory: URL,
                             policy: DownloadPolicy,
                             expectedByteCount: Int64? = nil,
-                            expectedDigest: String? = nil) -> (name: String, skipped: Bool) {
+                            expectedDigestProvider: (() -> String?)? = nil) -> (name: String, skipped: Bool) {
         let sanitized = Self.directoryComponent(base, fallback: "xhs")
         let suffix = ext.isEmpty ? "" : "." + ext
         var candidate = sanitized + suffix
@@ -231,7 +288,7 @@ actor FileArchiver {
             let url = directory.appendingPathComponent(candidate)
             if policy.skipExisting,
                Self.isUsableExistingFile(url, expectedByteCount: expectedByteCount,
-                                         expectedDigest: expectedDigest) {
+                                         expectedDigest: expectedDigestProvider?()) {
                 return (candidate, true)
             }
             candidate = sanitized + "_" + String(counter) + suffix
@@ -248,21 +305,26 @@ actor FileArchiver {
         guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
               values.isRegularFile == true, let size = values.fileSize, size > 0 else { return false }
         if let expectedByteCount, expectedByteCount > 0, Int64(size) != expectedByteCount { return false }
-        if let expectedDigest, let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) {
-            return digest(of: data) == expectedDigest
+        if let expectedDigest {
+            return digest(ofFile: url) == expectedDigest
         }
-        return expectedDigest == nil
+        return true
     }
 
-    /// Streaming SHA-256 of the staged original, used as the identity check.
+    /// True streaming SHA-256 in 512KB chunks to avoid faulting multi-hundred-MB
+    /// videos into memory when checking archive identity.
     static func digest(ofFile url: URL) -> String? {
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return nil }
-        return digest(of: data)
-    }
-
-    private static func digest(of data: Data) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
         var hash = SHA256()
-        hash.update(data: data)
+        let chunkSize = 512 * 1024
+        while true {
+            let chunk: Data? = autoreleasepool {
+                try? handle.read(upToCount: chunkSize)
+            }
+            guard let chunk, !chunk.isEmpty else { break }
+            hash.update(data: chunk)
+        }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
@@ -270,20 +332,29 @@ actor FileArchiver {
     /// note identity instead of the (mutable) title alone.
     static func noteComponent(_ note: ResolvedNote) -> String {
         let title = note.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return title.isEmpty ? note.noteID : title + "_" + note.noteID
+        guard !title.isEmpty else { return note.noteID }
+        let suffix = "_" + note.noteID
+        let charBudget = max(12, 80 - suffix.count)
+        let byteBudget = max(24, 180 - suffix.utf8.count)
+        let bounded = title.count > charBudget ? String(title.prefix(charBudget)) : title
+        let prefix = NamingFormatter.truncateUTF8(bounded, maxBytes: byteBudget)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "._ "))
+        return prefix.isEmpty ? note.noteID : prefix + suffix
     }
 
-    /// Path components must stay inside the archive root, so separators and
-    /// control characters are collapsed and the length is bounded.
+    /// Path components must stay inside the archive root, so separators,
+    /// cross-filesystem invalid characters and control characters are collapsed
+    /// and both character count and UTF-8 byte length are bounded below APFS NAME_MAX.
     static func directoryComponent(_ raw: String, fallback: String) -> String {
         var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        value = value.replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "\\", with: "_")
-            .replacingOccurrences(of: "\0", with: "")
+        let forbidden = CharacterSet(charactersIn: "/:\\*?\"<>|\0")
+        value = value.components(separatedBy: forbidden).joined(separator: "_")
+        value = value.replacingOccurrences(of: "[\\p{Cntrl}]", with: "", options: .regularExpression)
         value = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
         value = value.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
         if value.count > 80 { value = String(value.prefix(80)) }
+        value = NamingFormatter.truncateUTF8(value, maxBytes: 180)
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
         return value.isEmpty ? fallback : value
     }
 }

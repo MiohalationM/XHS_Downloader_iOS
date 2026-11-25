@@ -4,9 +4,9 @@
 
 # 小红书下载器 · XHS Downloader for iOS
 
-**面向 iOS 26 的原生小红书无水印原件与实况下载器**
+**面向 iOS 17+ 的原生小红书无水印原件与实况下载器**
 
-[![Platform](https://img.shields.io/badge/Platform-iOS%2026.0%2B-FF2442?style=flat-square&logo=apple&logoColor=white)](https://developer.apple.com/ios/)
+[![Platform](https://img.shields.io/badge/Platform-iOS%2017.0%2B-FF2442?style=flat-square&logo=apple&logoColor=white)](https://developer.apple.com/ios/)
 [![Swift](https://img.shields.io/badge/Swift-SwiftUI-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org/)
 [![Version](https://img.shields.io/badge/Version-1.0-0A84FF?style=flat-square)](https://github.com/MiohalationM/XHS_Downloader_iOS/releases)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](LICENSE)
@@ -19,9 +19,9 @@
 
 ## ✨ 功能特性
 
-- **iOS 26 原生交互**：下载、笔记、设置三标签原生导航，采用 Liquid Glass 材质、iPad 自适应分栏布局与全链路触感反馈。
+- **iOS 17+ 原生交互**：下载、笔记、设置三标签原生导航与全链路触感反馈；iOS 17 在 iPad 上使用经典底部标签栏，iOS 18+ 启用自适应侧边栏（`sidebarAdaptable`），iOS 26+ 原生呈现 Liquid Glass 材质（iOS 17–18 自动适配细腻的 Material 毛玻璃样式）。
 - **多入口链接捕获**：
-  - **剪贴板自动识别**：回到前台时自动识别小红书链接并加入队列（可在设置中关闭，自动去重且跳过应用内复制）。
+  - **剪贴板识别**：支持底部一键从剪贴板解析下载；也可在「设置 → 快捷设置」中开启「自动下载剪贴板链接」（默认关闭以保护隐私，开启后回到前台自动去重入队并跳过应用内复制）。
   - **系统分享扩展**：在小红书 App 内通过系统分享直接推送至下载队列（基于 App Group）。
   - **手动输入 & 网页抓取**：支持粘贴含文案的混合文本，支持内置网页会话抓取。
   - **全域名兼容**：支持 `xiaohongshu.com`、`rednote.com` 笔记链接以及 `xhslink.com`、`xhslink.cn/o/...` 等短链接。
@@ -49,17 +49,17 @@
     <td align="center" width="33%">
       <img src="docs/screenshots/downloads-tab.png" width="240" alt="下载主页" /><br />
       <strong>下载主页</strong><br />
-      <sub>剪贴板自动识别 · 引导卡片 · 网页抓取</sub>
+      <sub>任务队列 · 剪贴板一键解析 · 筛选统计</sub>
     </td>
     <td align="center" width="33%">
-      <img src="docs/screenshots/library-multiselect-ios26.png" width="240" alt="媒体库多选管理" /><br />
-      <strong>媒体库与多选管理</strong><br />
-      <sub>分类筛选（图片 / 视频 / 实况）· 批量操作</sub>
+      <img src="docs/screenshots/notes-feed.png" width="240" alt="双列瀑布流笔记库" /><br />
+      <strong>双列瀑布流笔记库</strong><br />
+      <sub>发现 / 收藏平滑移位 · 分类筛选 · 搜索</sub>
     </td>
     <td align="center" width="33%">
-      <img src="docs/screenshots/livephoto-viewer-ios26.png" width="240" alt="全屏原件与实况查看器" /><br />
-      <strong>全屏原件与实况查看</strong><br />
-      <sub>无损缩放 · 长按播放 Live Photo · 静音切换</sub>
+      <img src="docs/screenshots/note-reader.png" width="240" alt="沉浸式笔记阅读器" /><br />
+      <strong>沉浸式笔记阅读器</strong><br />
+      <sub>高清多图浏览 · 一键复制文案 · 跳转原笔记</sub>
     </td>
   </tr>
 </table>
@@ -76,22 +76,22 @@
 
 ### 方式二：从源码构建
 
-- **环境要求**：macOS + Xcode（支持 **iOS 26.0 SDK**）
+- **环境要求**：macOS + Xcode（支持 **iOS 26.0 SDK**，最低运行系统 **iOS 17.0+**；系统特性分层：iOS 17 在 iPad 上使用经典底部标签栏并自动回退至 Material 毛玻璃样式，iOS 18+ 启用 iPad 自适应侧边栏 `sidebarAdaptable`，iOS 26+ 启用原生 Liquid Glass）
 - 克隆仓库并用 Xcode 打开 `XHS_Downloader_iOS.xcodeproj`：
   ```bash
   git clone https://github.com/MiohalationM/XHS_Downloader_iOS.git
   cd XHS_Downloader_iOS
   open XHS_Downloader_iOS.xcodeproj
   ```
-- 修改主目标与 `ShareExtension` 的签名 Team（如真机调试需配置对应 Bundle ID 与 App Group），选择真机或 iOS 26 模拟器运行。
+- 修改主目标与 `ShareExtension` 的签名 Team（如真机调试需配置对应 Bundle ID 与 App Group），选择真机或 iOS 17.0+ 模拟器运行。
 - 本机脚本调试与单元测试可参考 [开发环境说明](docs/DEVELOPMENT_ENVIRONMENT.md) 与 `./scripts/ios-dev.sh`。
 
 ### 基本使用步骤
 
-1. 在小红书复制笔记链接后打开本应用，默认自动解析并加入下载；也可通过底部 **「从剪贴板开始下载」**、**「手动输入」** 或小红书系统分享菜单触发。
+1. 在小红书复制笔记链接后打开本应用，点击底部 **「从剪贴板开始下载」**、使用 **「手动输入」**，或在小红书内通过系统分享菜单推送至下载队列（如需回到前台自动识别，可在 **设置 → 快捷设置** 开启 **「自动下载剪贴板链接」**）。
 2. 如需筛选单篇笔记中的部分图片/视频，可在 **设置** 中开启 **「下载前选择」**。
 3. 下载完成后可在 **笔记** 页或系统相册的 **「小红书下载器」** 相册中查看与管理。
-4. 如不希望应用自动读取剪贴板，可在 **设置** 中关闭 **「自动下载剪贴板链接」**。
+4. 可在 **设置** 中按需配置存储目标（系统相册 / Files 文件夹 / 双目标保存）、实况照片保存模式、文案归档格式与本地记录备份。
 
 ---
 
